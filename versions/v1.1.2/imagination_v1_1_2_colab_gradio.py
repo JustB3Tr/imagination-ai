@@ -5,12 +5,15 @@
 # - Multi-provider auth (HF OAuth, email/password; Google/GitHub/Apple stubs)
 # - Per-user + global memory
 # - Compute budget indicator (~58h/mo on L4)
+# - Slash commands: /code, /research, /image (default: chat)
+# - 4-bit quantization for fast loading + low VRAM
+# - Background pre-loading of all models at startup
 # ============================================================
 
 from __future__ import annotations
 
 """
-Colab: !pip install -q gradio transformers accelerate safetensors bitsandbytes requests beautifulsoup4 ddgs bcrypt
+Colab: !pip install -q gradio transformers accelerate safetensors bitsandbytes requests beautifulsoup4 ddgs bcrypt diffusers
 Mount Drive, set IMAGINATION_ROOT, then:
 %cd /content/imagination-v1.1.0/versions/v1.1.2
 !python imagination_v1_1_2_colab_gradio.py
@@ -31,6 +34,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoTokenizer,
+    BitsAndBytesConfig,
     TextIteratorStreamer,
 )
 
@@ -74,6 +78,20 @@ TRUSTED_DOMAINS_STARTER = [
     "who.int", "cdc.gov", "nih.gov", "ncbi.nlm.nih.gov", "nasa.gov", "noaa.gov", "usgs.gov",
 ]
 
+SLASH_COMMANDS = {
+    "/code": TaskId.CAD_CODER,
+    "/cad": TaskId.CAD_CODER,
+    "/research": TaskId.DEEP_RESEARCH,
+    "/image": TaskId.IMAGE_TINY,
+}
+
+BNB_4BIT = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+)
+
 
 class LRUCache(OrderedDict):
     def __init__(self, max_items: int):
@@ -97,6 +115,16 @@ SEARCH_CACHE = LRUCache(64)
 PAGE_CACHE = LRUCache(128)
 RUNTIME = RuntimeCache()
 GEN_LOCKS = {"main": Lock(), "cad_coder": Lock(), "reasoning_llm": Lock()}
+PRELOAD_STATUS: Dict[str, str] = {}
+
+
+def parse_slash_command(text: str) -> Tuple[TaskId, str]:
+    t = text.strip()
+    for cmd, task_id in SLASH_COMMANDS.items():
+        if t.lower().startswith(cmd):
+            rest = t[len(cmd):].strip()
+            return task_id, rest
+    return TaskId.CHAT_MAIN, t
 
 
 def clean_model_text(text: str) -> str:
@@ -122,9 +150,16 @@ def should_auto_web(text: str, force_web: bool = False) -> Tuple[bool, str]:
     return False, "no web trigger"
 
 
+def _use_4bit() -> bool:
+    return torch.cuda.is_available()
+
+
 def load_main_model(root_path: str) -> Tuple[Any, Any]:
     tok = AutoTokenizer.from_pretrained(root_path, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(root_path, device_map="auto", torch_dtype="auto")
+    kwargs: Dict[str, Any] = {"device_map": "auto", "torch_dtype": "auto"}
+    if _use_4bit():
+        kwargs["quantization_config"] = BNB_4BIT
+    model = AutoModelForCausalLM.from_pretrained(root_path, **kwargs)
     if getattr(tok, "pad_token_id", None) is None:
         tok.pad_token = tok.eos_token
     model.eval()
@@ -133,7 +168,10 @@ def load_main_model(root_path: str) -> Tuple[Any, Any]:
 
 def _load_cad_coder(paths: ModelPaths):
     tok = AutoTokenizer.from_pretrained(paths.cad_coder, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(paths.cad_coder, device_map="auto", torch_dtype="auto")
+    kwargs: Dict[str, Any] = {"device_map": "auto", "torch_dtype": "auto"}
+    if _use_4bit():
+        kwargs["quantization_config"] = BNB_4BIT
+    model = AutoModelForCausalLM.from_pretrained(paths.cad_coder, **kwargs)
     if getattr(tok, "pad_token_id", None) is None:
         tok.pad_token = tok.eos_token
     model.eval()
@@ -142,7 +180,10 @@ def _load_cad_coder(paths: ModelPaths):
 
 def _load_reasoning_llm(paths: ModelPaths):
     tok = AutoTokenizer.from_pretrained(paths.reasoning_llm, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(paths.reasoning_llm, device_map="auto", torch_dtype="auto")
+    kwargs: Dict[str, Any] = {"device_map": "auto", "torch_dtype": "auto"}
+    if _use_4bit():
+        kwargs["quantization_config"] = BNB_4BIT
+    model = AutoModelForCausalLM.from_pretrained(paths.reasoning_llm, **kwargs)
     if getattr(tok, "pad_token_id", None) is None:
         tok.pad_token = tok.eos_token
     model.eval()
@@ -171,12 +212,60 @@ def _load_tiny_sd(paths: ModelPaths):
     return {"pipeline": pipe}
 
 
+def preload_all_models(root_path: str) -> None:
+    paths = ModelPaths(root=root_path)
+
+    def _load(name: str, loader, *args):
+        try:
+            PRELOAD_STATUS[name] = "loading"
+            print(f"[preload] Loading {name}...")
+            result = loader(*args) if args else loader(paths)
+            RUNTIME.set(name, result)
+            PRELOAD_STATUS[name] = "ready"
+            print(f"[preload] {name} ready.")
+        except Exception as e:
+            PRELOAD_STATUS[name] = f"error: {e}"
+            print(f"[preload] {name} failed: {e}")
+
+    def _load_main():
+        try:
+            PRELOAD_STATUS["main"] = "loading"
+            print("[preload] Loading main model...")
+            tok, mdl = load_main_model(paths.main_llm)
+            RUNTIME.main_tokenizer = tok
+            RUNTIME.main_model = mdl
+            PRELOAD_STATUS["main"] = "ready"
+            print("[preload] main model ready.")
+        except Exception as e:
+            PRELOAD_STATUS["main"] = f"error: {e}"
+            print(f"[preload] main model failed: {e}")
+
+    threads = [
+        Thread(target=_load_main, daemon=True),
+        Thread(target=_load, args=("cad_coder", _load_cad_coder), daemon=True),
+        Thread(target=_load, args=("reasoning_llm", _load_reasoning_llm), daemon=True),
+        Thread(target=_load, args=("embeddings", _load_embeddings), daemon=True),
+        Thread(target=_load, args=("reranker", _load_reranker), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+
+
 def ensure_modules_loaded(task_id: TaskId, root_path: str) -> List[str]:
     paths = ModelPaths(root=root_path)
     status: List[str] = []
 
     def ensure(key: str, loader):
         if RUNTIME.get(key) is None:
+            ps = PRELOAD_STATUS.get(key, "")
+            if ps == "loading":
+                status.append(f"- Waiting for `{key}` (pre-loading)...")
+                import time
+                while PRELOAD_STATUS.get(key) == "loading":
+                    time.sleep(0.5)
+                if RUNTIME.get(key) is not None:
+                    status.append(f"- `{key}` ready (pre-loaded).")
+                    return
             status.append(f"- Loading `{key}`...")
             RUNTIME.set(key, loader(paths))
             status.append(f"- Loaded `{key}`.")
@@ -334,7 +423,6 @@ def build_retrieval_bundle(
 
 
 def chat_submit(
-    task_label: str,
     root_path_in: str,
     user_msg: str,
     conversation_state: List[Dict[str, str]],
@@ -358,16 +446,24 @@ def chat_submit(
         yield display_state, conversation_state, display_state, empty_sources, "### Trace\n\n_No trace yet._", "### Thinking Path\n\n_No thinking yet._", "⚠️ No question entered."
         return
 
+    task_id, clean_msg = parse_slash_command(user_msg)
+    display_msg = user_msg
+
     specs = get_task_specs()
-    label_to_id = {s.label: s.id for s in specs}
-    task_id = label_to_id.get(task_label, TaskId.CHAT_MAIN)
+    task_label = next((s.label for s in specs if s.id == task_id), "Chat (main)")
 
     if RUNTIME.main_model is None or RUNTIME.main_tokenizer is None:
-        tok, mdl = load_main_model(paths.main_llm)
-        RUNTIME.main_tokenizer = tok
-        RUNTIME.main_model = mdl
+        ps = PRELOAD_STATUS.get("main", "")
+        if ps == "loading":
+            import time
+            while PRELOAD_STATUS.get("main") == "loading":
+                time.sleep(0.5)
+        if RUNTIME.main_model is None or RUNTIME.main_tokenizer is None:
+            tok, mdl = load_main_model(paths.main_llm)
+            RUNTIME.main_tokenizer = tok
+            RUNTIME.main_model = mdl
 
-    working_display = display_state + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": ""}]
+    working_display = display_state + [{"role": "user", "content": display_msg}, {"role": "assistant", "content": ""}]
     sources_html = "<div class='sources-empty'>Run a search or ask a current-events question.</div>"
     trace_parts = ["### Trace", "", f"- Task: **{task_label}**", f"- Root: `{root_path}`"]
     thinking_md = "### Thinking Path\n\n_Starting..._"
@@ -380,10 +476,10 @@ def chat_submit(
         trace_parts.extend([f"  {ln}" for ln in load_lines])
         yield working_display, conversation_state, display_state, sources_html, "\n".join(trace_parts), thinking_md, "📦 Modules loaded..."
 
-    use_web, reason = should_auto_web(user_msg, force_web=force_web)
+    use_web, reason = should_auto_web(clean_msg, force_web=force_web)
     trace_parts.append(f"- Route: **{'web + model' if use_web else 'model only'}**")
     trace_parts.append(f"- Decision reason: **{reason}**")
-    trace_parts.append(f"- Query: `{user_msg}`")
+    trace_parts.append(f"- Query: `{clean_msg}`")
     trace_md = "\n".join(trace_parts)
     max_new_tokens = int(user_max_tokens or DEFAULT_MAX_NEW_TOKENS)
 
@@ -392,13 +488,13 @@ def chat_submit(
 
     if use_web:
         yield working_display, conversation_state, display_state, sources_html, trace_md, thinking_md, "🌐 Searching..."
-        retrieved_notes, sources_html, trace_md_full, source_cards = build_retrieval_bundle(user_msg, trusted_domains)
+        retrieved_notes, sources_html, trace_md_full, source_cards = build_retrieval_bundle(clean_msg, trusted_domains)
         max_new_tokens = max(max_new_tokens, WEB_MAX_NEW_TOKENS)
         trace_md = trace_md_full if show_traces else trace_md + f"\n- Sources kept: **{MAX_SOURCES} max**"
         thinking_md = build_thinking_path(
             use_web=True,
             reason=reason,
-            query=user_msg,
+            query=clean_msg,
             source_cards=source_cards,
             conversation_turns=len([m for m in conversation_state or [] if m.get("role") in ("user", "assistant")]),
         )
@@ -411,7 +507,7 @@ def chat_submit(
     global_mem = load_global_memory(root_path)
     user_mem = load_user_memory(root_path, user_id) if user_id else ""
     system_prompt = build_system_prompt(global_mem, user_mem, retrieved_notes, thinking_md)
-    messages = build_messages(conversation_state, user_msg, system_prompt)
+    messages = build_messages(conversation_state, clean_msg, system_prompt)
 
     if task_id == TaskId.CAD_CODER:
         cad = RUNTIME.get("cad_coder")
@@ -434,15 +530,15 @@ def chat_submit(
 
         final_text = clean_model_text(final_text)
         working_display[-1] = {"role": "assistant", "content": final_text}
-        new_conv = conversation_state + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": final_text}]
-        new_disp = display_state + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": final_text}]
+        new_conv = conversation_state + [{"role": "user", "content": clean_msg}, {"role": "assistant", "content": final_text}]
+        new_disp = display_state + [{"role": "user", "content": display_msg}, {"role": "assistant", "content": final_text}]
         yield new_disp, new_conv, new_disp, sources_html, trace_md, thinking_md, "✓ Done"
 
     except Exception as e:
         err_text = f"Error: {e}"
         working_display[-1] = {"role": "assistant", "content": err_text}
-        new_conv = conversation_state + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": err_text}]
-        new_disp = display_state + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": err_text}]
+        new_conv = conversation_state + [{"role": "user", "content": clean_msg}, {"role": "assistant", "content": err_text}]
+        new_disp = display_state + [{"role": "user", "content": display_msg}, {"role": "assistant", "content": err_text}]
         yield new_disp, new_conv, new_disp, sources_html, trace_md, thinking_md, f"✖ {e}"
 
 
@@ -543,7 +639,6 @@ button:hover{
 
 def build_ui():
     task_specs = get_task_specs()
-    task_labels = [s.label for s in task_specs]
     root_default = os.getenv("IMAGINATION_ROOT", "/content/imagination-v1.1.0")
 
     theme = gr.themes.Soft(primary_hue="indigo", secondary_hue="blue", neutral_hue="slate")
@@ -562,7 +657,7 @@ def build_ui():
             <div class="hero">
               <div>
                 <div class="hero-title">IMAGINATION v1.1.2</div>
-                <div class="hero-sub">Thinking Path • per-user memory • compute budget • multi-provider auth</div>
+                <div class="hero-sub">Thinking Path &bull; per-user memory &bull; compute budget &bull; slash commands</div>
               </div>
               <div style="display:flex;align-items:center;gap:12px;">
                 {budget_html()}
@@ -578,23 +673,22 @@ def build_ui():
                 with gr.Column(scale=7):
                     with gr.Column(elem_classes=["card", "section-pad"]):
                         gr.Markdown("<div class='smallcap'>Chat</div>")
-                        with gr.Row():
-                            task = gr.Dropdown(choices=task_labels, value=task_labels[0], label="Task", info="Main stays loaded. Others load on demand.")
-                            root_path = gr.Textbox(label="Model root", value=root_default, info="Path to imagination-v1.1.0")
                         try:
                             chat = gr.Chatbot(elem_id="chatbox", height=520, buttons=["copy", "copy_all"], layout="bubble")
                         except TypeError:
                             chat = gr.Chatbot(elem_id="chatbox", height=520, layout="bubble")
-                        user = gr.Textbox(label="Message", placeholder="Ask anything…", lines=3)
+                        user = gr.Textbox(label="Message", placeholder="Ask anything… or use /code /research /image", lines=2)
                         with gr.Row():
                             send = gr.Button("Send", variant="primary")
                             clear = gr.Button("Clear")
+                        with gr.Accordion("Settings", open=False):
+                            root_path = gr.Textbox(label="Model root", value=root_default, info="Path to imagination-v1.1.0")
+                            with gr.Row():
+                                force_web = gr.Checkbox(label="Force web search", value=False)
+                                show_traces = gr.Checkbox(label="Show trace details", value=True)
+                            user_max_tokens = gr.Slider(160, 700, step=20, value=DEFAULT_MAX_NEW_TOKENS, label="Max new tokens")
                             clear_modules_btn = gr.Button("Unload modules")
-                        with gr.Row():
-                            force_web = gr.Checkbox(label="Force web search", value=False)
-                            show_traces = gr.Checkbox(label="Show trace details", value=True)
-                        user_max_tokens = gr.Slider(160, 700, step=20, value=DEFAULT_MAX_NEW_TOKENS, label="Max new tokens")
-                        gr.Markdown("<div class='note'>Tip: lower tokens = faster.</div>")
+                        gr.Markdown("<div class='note'>Commands: <b>/code</b> (CAD coder) · <b>/research</b> (deep research) · <b>/image</b> (image gen) · default: chat</div>")
 
                 with gr.Column(scale=5):
                     with gr.Tabs():
@@ -647,7 +741,7 @@ def build_ui():
             demo.load(fn=load_memory_ui, inputs=[root_path, user_state], outputs=[memory_global, memory_user])
 
             def chat_inputs():
-                return [task, root_path, user, conversation_state, display_state, force_web, show_traces, user_max_tokens, user_state]
+                return [root_path, user, conversation_state, display_state, force_web, show_traces, user_max_tokens, user_state]
 
             send_evt = send.click(
                 fn=chat_submit,
@@ -684,5 +778,8 @@ def build_ui():
 
 
 if __name__ == "__main__":
+    root = resolve_root_path(None)
+    print(f"[startup] Pre-loading all models from {root} with 4-bit quantization...")
+    preload_all_models(root)
     demo = build_ui()
     demo.launch(share=True, debug=True)
