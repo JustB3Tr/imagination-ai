@@ -581,7 +581,10 @@ def build_ui():
                         with gr.Row():
                             task = gr.Dropdown(choices=task_labels, value=task_labels[0], label="Task", info="Main stays loaded. Others load on demand.")
                             root_path = gr.Textbox(label="Model root", value=root_default, info="Path to imagination-v1.1.0")
-                        chat = gr.Chatbot(elem_id="chatbox", height=520, buttons=["copy", "copy_all"], layout="bubble")
+                        try:
+                            chat = gr.Chatbot(elem_id="chatbox", height=520, buttons=["copy", "copy_all"], layout="bubble")
+                        except TypeError:
+                            chat = gr.Chatbot(elem_id="chatbox", height=520, layout="bubble")
                         user = gr.Textbox(label="Message", placeholder="Ask anything…", lines=3)
                         with gr.Row():
                             send = gr.Button("Send", variant="primary")
