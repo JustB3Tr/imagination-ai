@@ -673,10 +673,22 @@ def build_ui():
                 with gr.Column(scale=7):
                     with gr.Column(elem_classes=["card", "section-pad"]):
                         gr.Markdown("<div class='smallcap'>Chat</div>")
-                        try:
-                            chat = gr.Chatbot(elem_id="chatbox", height=520, buttons=["copy", "copy_all"], layout="bubble")
-                        except TypeError:
-                            chat = gr.Chatbot(elem_id="chatbox", height=520, layout="bubble")
+                        def _make_chatbot():
+                            combos = [
+                                {"elem_id": "chatbox", "height": 520, "type": "messages", "buttons": ["copy", "copy_all"], "layout": "bubble"},
+                                {"elem_id": "chatbox", "height": 520, "type": "messages", "layout": "bubble"},
+                                {"elem_id": "chatbox", "height": 520, "type": "messages"},
+                                {"elem_id": "chatbox", "height": 520, "buttons": ["copy", "copy_all"], "layout": "bubble"},
+                                {"elem_id": "chatbox", "height": 520, "layout": "bubble"},
+                                {"elem_id": "chatbox", "height": 520},
+                            ]
+                            for kw in combos:
+                                try:
+                                    return gr.Chatbot(**kw)
+                                except TypeError:
+                                    continue
+                            return gr.Chatbot(elem_id="chatbox", height=520)
+                        chat = _make_chatbot()
                         user = gr.Textbox(label="Message", placeholder="Ask anything… or use /code /research /image", lines=2)
                         with gr.Row():
                             send = gr.Button("Send", variant="primary")
