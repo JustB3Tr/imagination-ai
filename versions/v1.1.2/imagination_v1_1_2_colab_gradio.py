@@ -668,7 +668,16 @@ def build_ui():
             clear.click(fn=clear_all, inputs=None, outputs=[chat, conversation_state, display_state, sources_html, trace_md, thinking_md, status, user])
             clear_modules_btn.click(fn=clear_modules, inputs=None, outputs=status)
 
-            gr.LoginButton(value="Sign in with Hugging Face")
+            _hf_ok = os.getenv("SPACE_ID") or os.getenv("HF_TOKEN") or False
+            try:
+                from huggingface_hub import get_token
+                _hf_ok = _hf_ok or get_token() is not None
+            except Exception:
+                pass
+            if _hf_ok:
+                gr.LoginButton(value="Sign in with Hugging Face")
+            else:
+                gr.Markdown("<div class='note'>HF Sign-in unavailable (set HF_TOKEN or run on Spaces).</div>")
 
     demo.queue(default_concurrency_limit=1)
     return demo
