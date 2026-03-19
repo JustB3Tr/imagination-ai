@@ -1,0 +1,73 @@
+# Imagination v1.1.2 — Cloud validation
+# Runs on every push to main. Validates that the app builds and imports correctly.
+# This is the "cloud agent" that exercises the repo when you push.
+
+name: Validate v1.1.2
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: versions/v1.1.2
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: v112-${{ runner.os }}-pip-${{ hashFiles('versions/v1.1.2/requirements.txt') }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Create minimal model root (for path resolution)
+        run: |
+          FAKE_ROOT="$GITHUB_WORKSPACE/.ci-fake-root"
+          mkdir -p "$FAKE_ROOT/modules/cad"
+          mkdir -p "$FAKE_ROOT/modules/reasoning"
+          mkdir -p "$FAKE_ROOT/modules/research/embeddings"
+          mkdir -p "$FAKE_ROOT/modules/research/reranker"
+          mkdir -p "$FAKE_ROOT/modules/image"
+          mkdir -p "$FAKE_ROOT/temp"
+          echo "IMAGINATION_ROOT=$FAKE_ROOT" >> $GITHUB_ENV
+
+      - name: Validate runtime imports
+        run: |
+          python -c "
+          from imagination_runtime.paths import resolve_root_path, ModelPaths
+          from imagination_runtime.registry import get_task_specs, TaskId
+          from imagination_runtime.thinking import build_thinking_path, build_thinking_path_no_web
+          from imagination_runtime.budget import remaining_hours, is_low_budget
+          from imagination_runtime.auth import login_email_password
+          from imagination_runtime.users import load_global_memory, load_user_memory
+          root = resolve_root_path(None)
+          specs = get_task_specs()
+          assert len(specs) >= 4
+          print('Runtime modules OK')
+          "
+
+      - name: Build UI (smoke test)
+        run: |
+          python -c "
+          from imagination_v1_1_2_colab_gradio import build_ui
+          demo = build_ui()
+          assert demo is not None
+          print('UI built OK')
+          "
