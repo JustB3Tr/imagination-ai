@@ -2,10 +2,61 @@
 
 ## Cursor Cloud specific instructions
 
-This repository (`imagination-ai`) is currently a greenfield project with only a `README.md`. There are no services, dependencies, build systems, or test infrastructure to set up.
+This is a Python/Gradio AI application ("Imagination v1.1.2"). The primary runnable code lives in `versions/v1.1.2/`.
 
-- **No package manager or dependency files** exist yet (no `package.json`, `requirements.txt`, `Cargo.toml`, etc.).
-- **No lint, test, or build commands** are available.
-- **No services** need to be started for development.
+### Key paths
 
-When source code and dependencies are added, update this file with setup/run/test instructions.
+- **App entrypoint**: `versions/v1.1.2/app.py` (calls `build_ui()` from `imagination_v1_1_2_colab_gradio.py`)
+- **Runtime library**: `versions/v1.1.2/imagination_runtime/`
+- **Requirements**: `versions/v1.1.2/requirements.txt`
+- **CI workflow**: `.github/workflows/validate-v112.yml`
+
+### Running locally without model weights
+
+The app requires an `IMAGINATION_ROOT` env var pointing to a directory with the expected module subdirectories. For local dev without actual model weights, create a fake root:
+
+```bash
+FAKE_ROOT="/workspace/.ci-fake-root"
+mkdir -p "$FAKE_ROOT/modules/cad" "$FAKE_ROOT/modules/reasoning" \
+         "$FAKE_ROOT/modules/research/embeddings" "$FAKE_ROOT/modules/research/reranker" \
+         "$FAKE_ROOT/modules/image" "$FAKE_ROOT/temp"
+export IMAGINATION_ROOT="$FAKE_ROOT"
+```
+
+### OAuth/LoginButton gotcha
+
+The Gradio `LoginButton` (HuggingFace OAuth) requires a valid HF token for local dev mocking. Without `HF_TOKEN` set and authenticated via `huggingface-cli login`, `build_ui()` will fail with `ValueError: Your machine must be logged in to HF`. To work around this without a real token, patch `gradio.oauth._get_mocked_oauth_info` before calling `build_ui()` — see the CI-like smoke test approach below.
+
+### Smoke tests (same as CI)
+
+From `versions/v1.1.2/`:
+
+```bash
+# Validate runtime imports
+python3 -c "
+from imagination_runtime.paths import resolve_root_path, ModelPaths
+from imagination_runtime.registry import get_task_specs, TaskId
+from imagination_runtime.thinking import build_thinking_path, build_thinking_path_no_web
+from imagination_runtime.budget import remaining_hours, is_low_budget
+from imagination_runtime.auth import login_email_password
+from imagination_runtime.users import load_global_memory, load_user_memory
+root = resolve_root_path(None)
+specs = get_task_specs()
+assert len(specs) >= 4
+print('Runtime modules OK')
+"
+```
+
+### Launching the Gradio UI
+
+From `versions/v1.1.2/`, with `IMAGINATION_ROOT` set:
+
+```bash
+python3 app.py
+```
+
+Chat inference will fail without real model weights (expected). The UI itself loads and is fully interactive.
+
+### Dependencies
+
+Install with `pip install -r versions/v1.1.2/requirements.txt` plus `pip install "gradio[oauth]"` for the OAuth extras (`itsdangerous`, `authlib`) needed by the `LoginButton`.
