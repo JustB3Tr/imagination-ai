@@ -1,0 +1,11 @@
+gradio
+transformers
+accelerate
+safetensors
+bitsandbytes
+torch
+requests
+beautifulsoup4
+ddgs
+diffusers
+
