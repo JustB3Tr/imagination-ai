@@ -6,15 +6,15 @@ Use this skill when a Cloud agent needs to run, smoke-test, or debug this repo q
 ## First 5 minutes: practical setup
 1. From repo root (`/workspace`), install app deps for active runtime:
    - `cd versions/v1.1.2`
-   - `python -m pip install --upgrade pip`
-   - `pip install -r requirements.txt`
+   - `python3 -m pip install --upgrade pip`
+   - `python3 -m pip install -r requirements.txt`
 2. Set model root:
    - Real models: `export IMAGINATION_ROOT=/workspace`
    - Mocked root for smoke tests: `export IMAGINATION_ROOT=/tmp/imagination-fake-root`
 3. Create temp dirs if mocking:
    - `mkdir -p "$IMAGINATION_ROOT"/modules/{cad,reasoning,research/embeddings,research/reranker,image} "$IMAGINATION_ROOT"/temp`
 4. Start app (Spaces-style entrypoint):
-   - `python app.py`
+   - `python3 app.py`
 
 ## Environment toggles and quick mocks (feature-flag-like behavior)
 - `IMAGINATION_ROOT`: controls model/data root resolution in runtime path helpers.
@@ -42,9 +42,9 @@ Use this skill when a Cloud agent needs to run, smoke-test, or debug this repo q
 Run from `versions/v1.1.2`:
 1. `export IMAGINATION_ROOT=/tmp/imagination-fake-root`
 2. `mkdir -p "$IMAGINATION_ROOT"/modules/{cad,reasoning,research/embeddings,research/reranker,image} "$IMAGINATION_ROOT"/temp`
-3. `python -c "from imagination_runtime.paths import resolve_root_path, ModelPaths; print(resolve_root_path(None)); print(ModelPaths(resolve_root_path(None)).cad_coder)"`
-4. `python -c "from imagination_runtime.registry import get_task_specs; print(len(get_task_specs()))"`
-5. `python -c "from imagination_v1_1_2_colab_gradio import build_ui; d = build_ui(); print(type(d).__name__)"`
+3. `python3 -c "from imagination_runtime.paths import resolve_root_path, ModelPaths; print(resolve_root_path(None)); print(ModelPaths(resolve_root_path(None)).cad_coder)"`
+4. `python3 -c "from imagination_runtime.registry import get_task_specs; print(len(get_task_specs()))"`
+5. `python3 -c "from imagination_v1_1_2_colab_gradio import build_ui; d = build_ui(); print(type(d).__name__)"`
 
 Pass criteria:
 - Imports succeed.
@@ -54,7 +54,7 @@ Pass criteria:
 ### Workflow B: app launch + manual functional checks
 Run from `versions/v1.1.2`:
 1. Set real root if weights exist: `export IMAGINATION_ROOT=/workspace`
-2. Start app: `python app.py`
+2. Start app: `python3 app.py`
 3. Open local URL and validate:
    - Send a normal chat message.
    - Send `/code ...`, `/research ...`, `/image ...` messages.
@@ -67,7 +67,7 @@ Pass criteria:
 - Sources/trace/thinking panes update without frontend errors.
 
 ### Workflow C: login/auth behavior check
-1. `export HF_TOKEN=dummy` then run `python app.py` and confirm HF sign-in control appears.
+1. `export HF_TOKEN=dummy` then run `python3 app.py` and confirm HF sign-in control appears.
 2. `unset HF_TOKEN SPACE_ID` then rerun and confirm fallback note appears.
 
 Pass criteria:
@@ -83,11 +83,11 @@ Pass criteria:
 
 ### Test workflow
 Run from `versions/v1.1.1/subversions/after`:
-1. `python -m pip install --upgrade pip`
-2. `pip install -r requirements.txt`
+1. `python3 -m pip install --upgrade pip`
+2. `python3 -m pip install -r requirements.txt`
 3. `export IMAGINATION_ROOT=/workspace`
-4. `python -c "from imagination_v1_1_1_colab_gradio import build_ui; d = build_ui(); print(type(d).__name__)"`
-5. Optional full launch: `python app.py`
+4. `python3 -c "from imagination_v1_1_1_colab_gradio import build_ui; d = build_ui(); print(type(d).__name__)"`
+5. Optional full launch: `python3 app.py`
 
 Pass criteria:
 - Legacy UI builds; optional launch starts on configured port.
@@ -102,10 +102,10 @@ Pass criteria:
 
 ### Test workflow
 Run from repo root:
-1. `python -m pip install --upgrade pip`
-2. `pip install gradio`
-3. `python -c "from deep_research_colab_skeleton import chunk_documents, FetchedPage, ResearchConfig; pages=[FetchedPage(url='u', title='t', text='abc '*800)]; print(len(chunk_documents(pages, ResearchConfig())))"`
-4. `python -c "import deep_research_gradio_ui as ui; print(hasattr(ui, 'launch'))"`
+1. `python3 -m pip install --upgrade pip`
+2. `python3 -m pip install gradio`
+3. `python3 -c "from deep_research_colab_skeleton import chunk_documents, FetchedPage, ResearchConfig; pages=[FetchedPage(url='u', title='t', text='abc '*800)]; print(len(chunk_documents(pages, ResearchConfig())))"`
+4. `python3 -c "import deep_research_gradio_ui as ui; print(hasattr(ui, 'launch'))"`
 
 Pass criteria:
 - Deterministic helper functions run.
