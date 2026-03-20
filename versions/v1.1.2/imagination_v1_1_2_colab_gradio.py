@@ -212,43 +212,25 @@ def _load_tiny_sd(paths: ModelPaths):
     return {"pipeline": pipe}
 
 
-def preload_all_models(root_path: str) -> None:
+def preload_main_model(root_path: str) -> None:
+    """Pre-load only the main chat model in a background thread.
+    Other models load on demand when a slash command is used, to avoid OOM."""
     paths = ModelPaths(root=root_path)
-
-    def _load(name: str, loader, *args):
-        try:
-            PRELOAD_STATUS[name] = "loading"
-            print(f"[preload] Loading {name}...")
-            result = loader(*args) if args else loader(paths)
-            RUNTIME.set(name, result)
-            PRELOAD_STATUS[name] = "ready"
-            print(f"[preload] {name} ready.")
-        except Exception as e:
-            PRELOAD_STATUS[name] = f"error: {e}"
-            print(f"[preload] {name} failed: {e}")
 
     def _load_main():
         try:
             PRELOAD_STATUS["main"] = "loading"
-            print("[preload] Loading main model...")
+            print("[preload] Loading main model (4-bit)...")
             tok, mdl = load_main_model(paths.main_llm)
             RUNTIME.main_tokenizer = tok
             RUNTIME.main_model = mdl
             PRELOAD_STATUS["main"] = "ready"
-            print("[preload] main model ready.")
+            print("[preload] Main model ready.")
         except Exception as e:
             PRELOAD_STATUS["main"] = f"error: {e}"
-            print(f"[preload] main model failed: {e}")
+            print(f"[preload] Main model failed: {e}")
 
-    threads = [
-        Thread(target=_load_main, daemon=True),
-        Thread(target=_load, args=("cad_coder", _load_cad_coder), daemon=True),
-        Thread(target=_load, args=("reasoning_llm", _load_reasoning_llm), daemon=True),
-        Thread(target=_load, args=("embeddings", _load_embeddings), daemon=True),
-        Thread(target=_load, args=("reranker", _load_reranker), daemon=True),
-    ]
-    for t in threads:
-        t.start()
+    Thread(target=_load_main, daemon=True).start()
 
 
 def ensure_modules_loaded(task_id: TaskId, root_path: str) -> List[str]:
@@ -791,7 +773,8 @@ def build_ui():
 
 if __name__ == "__main__":
     root = resolve_root_path(None)
-    print(f"[startup] Pre-loading all models from {root} with 4-bit quantization...")
-    preload_all_models(root)
+    print(f"[startup] Pre-loading main model from {root} with 4-bit quantization...")
+    print("[startup] Other models load on demand: /code /research /image")
+    preload_main_model(root)
     demo = build_ui()
     demo.launch(share=True, debug=True)
