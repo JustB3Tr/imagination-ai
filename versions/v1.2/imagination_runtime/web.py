@@ -1,14 +1,78 @@
 from __future__ import annotations
 
+import datetime
 import html
 import re
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Optional
 
 import requests
 from bs4 import BeautifulSoup
 from ddgs import DDGS
+
+# User asks for "recent events" / "things to do" — raw DDGS often returns Wikipedia for place names.
+_EVENT_INTENT = re.compile(
+    r"\b(events?|happening|concerts?|festivals?|things to do|what(?:'s|s| is) on)\b",
+    re.I,
+)
+_TIME_SENSITIVE = re.compile(
+    r"\b(recent|latest|current|today|now|this week|this month|upcoming|tonight|weekend)\b",
+    re.I,
+)
+_ENCYCLOPEDIA_HOST = (
+    "wikipedia.org",
+    "wiktionary.org",
+    "britannica.com",
+    "fandom.com",
+    "wikivoyage.org",
+)
+
+
+def is_events_style_query(query: str) -> bool:
+    q = (query or "").lower()
+    if _EVENT_INTENT.search(q):
+        return True
+    return bool(_TIME_SENSITIVE.search(q) and re.search(r"\b(event|events|concert|festival|fair|parade)\b", q))
+
+
+def refine_search_query(query: str) -> str:
+    """Widen/narrow DDGS query so local listings rank better than encyclopedia pages."""
+    q = (query or "").strip()
+    if not q or not is_events_style_query(q):
+        return q
+    low = q.lower()
+    now = datetime.datetime.now()
+    bits = [q]
+    if "calendar" not in low and "eventbrite" not in low:
+        bits.append(f"upcoming events calendar {now.strftime('%B %Y')}")
+    elif str(now.year) not in q:
+        bits.append(str(now.year))
+    return " ".join(bits)
+
+
+def _events_listing_tier(r: Dict) -> int:
+    """
+    Lower is better for event-style queries. Encyclopedias and generic wikis sink to the bottom.
+    """
+    url = (r.get("url") or "").lower()
+    dom = (r.get("domain") or "").lower()
+    title = (r.get("title") or "").lower()
+    if any(h in url for h in _ENCYCLOPEDIA_HOST):
+        return 40
+    if any(x in dom for x in ("eventbrite.", "ticketmaster.", "meetup.", "stubhub.")):
+        return 0
+    if dom.endswith(".gov") or "visitarizona" in dom or dom.startswith("visit") or "tourism" in dom:
+        return 5
+    if "chamber" in dom or "downtow" in dom or "mainstreet" in dom:
+        return 6
+    if "event" in dom or "calendar" in dom:
+        return 7
+    if any(w in title for w in ("event", "calendar", "festival", "concert", "tickets", "register")):
+        return 8
+    if r.get("trusted"):
+        return 15
+    return 20
 
 
 def get_domain(url: str) -> str:
@@ -31,14 +95,19 @@ def web_search(
     trusted_domains: List[str],
     cache: Dict[str, List[Dict]],
 ) -> List[Dict]:
-    key = query.strip().lower()
+    original = (query or "").strip()
+    search_q = refine_search_query(original)
+    key = search_q.lower()
     if key in cache:
         return cache[key]
+
+    events_mode = is_events_style_query(original)
+    fetch_cap = min(24, max(max_results * 3, max_results)) if events_mode else max_results
 
     results: List[Dict] = []
     seen = set()
     with DDGS() as ddgs:
-        for r in ddgs.text(query, max_results=max_results):
+        for r in ddgs.text(search_q, max_results=fetch_cap):
             url = (r.get("href") or "").strip()
             if not url or url in seen:
                 continue
@@ -55,7 +124,17 @@ def web_search(
                 }
             )
 
-    results.sort(key=lambda x: (not x["trusted"], x["domain"], x["title"]))
+    if events_mode:
+        results.sort(
+            key=lambda x: (
+                _events_listing_tier(x),
+                not x["trusted"],
+                x["domain"],
+                x["title"],
+            )
+        )
+    else:
+        results.sort(key=lambda x: (not x["trusted"], x["domain"], x["title"]))
     trimmed = results[:max_sources]
     cache[key] = trimmed
     return trimmed
@@ -102,11 +181,65 @@ def fetch_page(
         return ""
 
 
-def fetch_parallel(urls: List[str], *, timeout_s: int, max_chars: int, cache: Dict[str, str]) -> List[str]:
+def fetch_parallel(
+    urls: List[str],
+    *,
+    timeout_s: int,
+    max_chars: int,
+    cache: Dict[str, str],
+    on_fetched: Optional[Callable[[str, int], None]] = None,
+) -> List[str]:
+    """
+    Fetch URLs in parallel. If on_fetched is set, call it with (domain, index) after each URL finishes
+    (completion order may differ from input order).
+    """
+    if not urls:
+        return []
+
+    if on_fetched is None:
+        with ThreadPoolExecutor(max_workers=min(4, max(1, len(urls)))) as exe:
+            return list(
+                exe.map(
+                    lambda u: fetch_page(u, timeout_s=timeout_s, max_chars=max_chars, cache=cache),
+                    urls,
+                )
+            )
+
+    texts: List[str] = [""] * len(urls)
     with ThreadPoolExecutor(max_workers=min(4, max(1, len(urls)))) as exe:
-        return list(
-            exe.map(lambda u: fetch_page(u, timeout_s=timeout_s, max_chars=max_chars, cache=cache), urls)
-        )
+        future_to_idx = {
+            exe.submit(fetch_page, u, timeout_s=timeout_s, max_chars=max_chars, cache=cache): i
+            for i, u in enumerate(urls)
+        }
+        for fut in as_completed(future_to_idx):
+            idx = future_to_idx[fut]
+            try:
+                texts[idx] = fut.result()
+            except Exception:
+                texts[idx] = ""
+            domain = get_domain(urls[idx])
+            on_fetched(domain, idx)
+    return texts
+
+
+def fetch_urls_sequential(
+    urls: List[str],
+    *,
+    timeout_s: int,
+    max_chars: int,
+    cache: Dict[str, str],
+    before_each: Optional[Callable[[str, int], None]] = None,
+) -> List[str]:
+    """
+    Fetch URLs one-by-one; optional before_each(domain, index) runs before each fetch
+    so the UI can show 'Reading example.com…' while the request is in flight.
+    """
+    out: List[str] = []
+    for i, url in enumerate(urls):
+        if before_each is not None:
+            before_each(get_domain(url), i)
+        out.append(fetch_page(url, timeout_s=timeout_s, max_chars=max_chars, cache=cache))
+    return out
 
 
 def sources_to_cards(sources: List[Dict]) -> str:

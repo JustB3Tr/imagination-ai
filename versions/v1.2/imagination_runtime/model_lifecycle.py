@@ -12,7 +12,7 @@ from .registry import TaskId
 
 # Estimated load times in seconds for progress bar
 KNOWN_LOAD_TIMES: Dict[str, int] = {
-    "cad_coder": 30,
+    "cad_coder": 75,
     "reasoning_llm": 60,
     "embeddings": 10,
     "reranker": 15,

@@ -32,6 +32,14 @@ Optional environment variables (set before running, or edit defaults below):
     IMAGINATION_ROOT        Content path for the repo (default: /content/imagination-v1.1.0)
     IMAGINATION_COPY        Set to "1" to copy Drive folder to /content instead of symlink (faster I/O, more disk)
     SKIP_PIP                Set to "1" to skip dependency install
+    IMAGINATION_CAD_CODER_PATH        Override coder weights dir (abs or relative to IMAGINATION_ROOT)
+    IMAGINATION_MAIN_MAX_NEW_TOKENS   Main chat upper bound (default 16384; model stops on EOS; max 131072)
+    IMAGINATION_REASONING_MAX_NEW_TOKENS  Reasoning/Research module (default 8192; max 131072)
+    IMAGINATION_CODER_MAX_NEW_TOKENS  Coder tab max new tokens (default 16384; e.g. 100000 for huge scripts)
+    IMAGINATION_CODER_SKIP_CLOAK      Set to "1" to stream raw coder output (recommended with very high coder tokens)
+    IMAGINATION_CODER_REPETITION_PENALTY  Coder generate repetition_penalty (default 1.22; try 1.35 if loops persist)
+    IMAGINATION_CODER_NO_REPEAT_NGRAM   e.g. 32 to forbid repeating same 32-token span (0/off to disable; can hurt some code)
+    IMAGINATION_TRAINING_LOG        Set to "0" to disable JSONL export of main-chat turns (default: on → temp/training_exports/)
     --launch                After setup: preload main LLM + start Gradio (same process as setup)
 """
 from __future__ import annotations
@@ -157,7 +165,10 @@ def _ensure_content_repo(drive_src: str, content_dst: str, copy: bool) -> None:
         os.symlink(drive_src, content_dst, target_is_directory=True)
 
 
-def main() -> None:
+def main() -> str:
+    """
+    Returns resolved IMAGINATION_ROOT (content path) for follow-up actions.
+    """
     print("Imagination v1.2 — Colab setup\n")
 
     if os.environ.get("SKIP_PIP", "").strip().lower() in ("1", "true", "yes"):
@@ -203,11 +214,54 @@ def main() -> None:
     print("  Setup finished.")
     print(f"  IMAGINATION_ROOT = {content_root}")
     print()
-    print("  Next cell — start the UI:")
+    print("  Next — start the UI (weights preload before the server opens):")
     print(f"    %cd {v12}")
     print("    !python app.py")
+    print()
+    print("  Or one cell after mount:")
+    print("    !python colab_setup.py --launch")
     print("=" * 56)
+
+    return content_root
+
+
+def _launch_gradio(content_root: str) -> None:
+    """Preload main LLM and open Gradio in this process (Colab-friendly)."""
+    v12 = Path(content_root) / "versions" / "v1.2"
+    if not v12.is_dir():
+        raise FileNotFoundError(f"Missing app folder: {v12}")
+    os.chdir(str(v12))
+    p = str(v12)
+    if p not in sys.path:
+        sys.path.insert(0, p)
+    os.environ["IMAGINATION_ROOT"] = content_root
+
+    print("\n[setup] Pre-loading main model, then starting Gradio…\n", flush=True)
+    from imagination_v1_2 import build_ui, preload_main_model
+
+    if os.getenv("SKIP_PRELOAD", "").strip().lower() not in ("1", "true", "yes"):
+        preload_main_model()
+    demo = build_ui()
+    port = int(os.getenv("PORT", "7860"))
+    share = os.getenv("GRADIO_SHARE", "true").lower() in ("1", "true", "yes")
+    print()
+    print("=" * 50)
+    print("  Imagination v1.2")
+    print("  Local:  http://localhost:" + str(port))
+    if share:
+        print("  Share:  (tunnel URL below)")
+    print("=" * 50)
+    print()
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=port,
+        share=share,
+        show_error=True,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    do_launch = "--launch" in sys.argv
+    content_root = main()
+    if do_launch:
+        _launch_gradio(content_root)

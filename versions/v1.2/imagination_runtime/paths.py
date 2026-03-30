@@ -20,6 +20,21 @@ def resolve_root_path(root_path: str | None) -> str:
     return p.rstrip("/\\")
 
 
+def resolve_cad_coder_dir(root: str) -> str:
+    """
+    Directory for the coder module weights.
+    Set IMAGINATION_CAD_CODER_PATH to an absolute path, or a path relative to IMAGINATION_ROOT,
+    if your folder name differs from the default (e.g. after swapping 3B → 7B weights).
+    """
+    override = (os.getenv("IMAGINATION_CAD_CODER_PATH") or "").strip()
+    if override:
+        p = override
+        if not os.path.isabs(p):
+            p = os.path.join(root, p)
+        return os.path.normpath(p)
+    return os.path.join(root, "modules", "cad", "qwen finetuned coder(3b)")
+
+
 @dataclass(frozen=True)
 class ModelPaths:
     root: str
@@ -30,7 +45,7 @@ class ModelPaths:
 
     @property
     def cad_coder(self) -> str:
-        return os.path.join(self.root, "modules", "cad", "qwen finetuned coder(3b)")
+        return resolve_cad_coder_dir(self.root)
 
     @property
     def reasoning_llm(self) -> str:

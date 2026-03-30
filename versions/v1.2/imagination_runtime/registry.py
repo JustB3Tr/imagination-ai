@@ -34,7 +34,7 @@ def get_task_specs() -> List[TaskSpec]:
         TaskSpec(
             id=TaskId.CAD_CODER,
             label="Coder",
-            description="Loads the CAD/coder finetune when selected.",
+            description="7B Qwen coder finetune (Lua, Python, C++, C#). Weights under modules/cad/ or IMAGINATION_CAD_CODER_PATH.",
             required_keys=["cad_coder"],
         ),
         TaskSpec(

@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 
@@ -180,11 +181,31 @@ def global_memory_path(root: str) -> str:
     return os.path.join(base, "global_memory.txt")
 
 
+def _bundled_default_global_memory() -> str:
+    """Shipped with v1.2; copied to temp/global_memory.txt on first load if missing."""
+    pkg = Path(__file__).resolve().parent.parent
+    p = pkg / "default_global_memory.txt"
+    if p.is_file():
+        try:
+            return p.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            pass
+    return ""
+
+
 def load_global_memory(root: str) -> str:
     path = global_memory_path(root)
+    existing = ""
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
-            return f.read().strip()
+            existing = f.read().strip()
+    if existing:
+        return existing
+    default = _bundled_default_global_memory()
+    if default:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(default + "\n")
+        return default
     return ""
 
 

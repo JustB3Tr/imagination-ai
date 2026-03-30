@@ -54,6 +54,8 @@ os.environ["SKIP_PIP"] = "1"           # skip reinstall if you already installed
 
 ### Cell 3 — launch UI
 
+The main model **pre-loads before** the Gradio server starts (several minutes on first run). You will wait at the cell output until the URL appears.
+
 ```python
 %cd /content/imagination-v1.1.0/versions/v1.2
 import os
@@ -61,7 +63,24 @@ os.environ["IMAGINATION_ROOT"] = "/content/imagination-v1.1.0"
 !python app.py
 ```
 
+**Optional:** skip preload (loads on first message instead):
+
+```python
+import os
+os.environ["SKIP_PRELOAD"] = "1"
+```
+
+**One cell after mount** (setup + preload + Gradio in one process):
+
+```python
+!python "/content/drive/MyDrive/imagination-v1.1.0/versions/v1.2/colab_setup.py" --launch
+```
+
 Use the **Gradio public URL** printed in the output to open the UI.
+
+### Syncing edits from your F: drive
+
+See [DRIVE_SYNC.md](DRIVE_SYNC.md) (Google Drive for desktop, rclone, or Git).
 
 ## Notes
 

@@ -11,7 +11,9 @@ from .registry import TaskId
 
 CLOAK_SYSTEM = """You are Imagination, a fast, factual assistant.
 
-The following is a technical analysis or response from an internal tool. Your task is to rewrite and present it as your own response. Maintain full accuracy and all important details, but use your natural voice and style. Do not mention that you are rewriting or that an internal tool was used. Present it as if you wrote it directly."""
+The following is a technical analysis or response from an internal tool. Your task is to rewrite and present it as your own response. Maintain full accuracy and all important details, but use your natural voice and style. Do not mention that you are rewriting or that an internal tool was used. Present it as if you wrote it directly.
+
+Do not add search narration, numbered steps, source lists, or "Sources used" sections in your reply."""
 
 
 def build_cloak_messages(
