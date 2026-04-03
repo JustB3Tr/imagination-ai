@@ -60,3 +60,13 @@ Chat inference will fail without real model weights (expected). The UI itself lo
 ### Dependencies
 
 Install with `pip install -r versions/v1.1.2/requirements.txt` plus `pip install "gradio[oauth]"` for the OAuth extras (`itsdangerous`, `authlib`) needed by the `LoginButton`.
+
+### Imagination v1.2.1 (Gradio + optional QLoRA training)
+
+- **App entrypoint**: [`versions/v1.2.1/app.py`](versions/v1.2.1/app.py) (imports `build_ui` / `preload_main_model` from [`imagination_v1_2_1.py`](versions/v1.2.1/imagination_v1_2_1.py))
+- **Runtime**: [`versions/v1.2.1/imagination_runtime/`](versions/v1.2.1/imagination_runtime/)
+- **Requirements**: [`versions/v1.2.1/requirements.txt`](versions/v1.2.1/requirements.txt) (includes `peft`, `trl`, `datasets` for training)
+- **Training script**: [`versions/v1.2.1/train_imagination.py`](versions/v1.2.1/train_imagination.py) — QLoRA on `final_dataset.jsonl` (or chat `messages` JSONL); `--model_path` should point at the same tree as `IMAGINATION_ROOT`
+- **Training exports**: turns append to `IMAGINATION_ROOT/temp/training_exports/training_turns.jsonl` (schema `imagination_turn_v2`) unless `IMAGINATION_TRAINING_LOG=0`
+
+Run the UI from `versions/v1.2.1/` with `IMAGINATION_ROOT` set: `python app.py`

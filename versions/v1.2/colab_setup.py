@@ -33,7 +33,7 @@ Optional environment variables (set before running, or edit defaults below):
     IMAGINATION_COPY        Set to "1" to copy Drive folder to /content instead of symlink (faster I/O, more disk)
     SKIP_PIP                Set to "1" to skip dependency install
     IMAGINATION_CAD_CODER_PATH        Override coder weights dir (abs or relative to IMAGINATION_ROOT)
-    IMAGINATION_MAIN_MAX_NEW_TOKENS   Main chat upper bound (default 16384; model stops on EOS; max 131072)
+    IMAGINATION_MAIN_MAX_NEW_TOKENS   Main chat desired max new tokens (default 8192; clamped to context left; stops on EOS)
     IMAGINATION_REASONING_MAX_NEW_TOKENS  Reasoning/Research module (default 8192; max 131072)
     IMAGINATION_CODER_MAX_NEW_TOKENS  Coder tab max new tokens (default 16384; e.g. 100000 for huge scripts)
     IMAGINATION_CODER_SKIP_CLOAK      Set to "1" to stream raw coder output (recommended with very high coder tokens)

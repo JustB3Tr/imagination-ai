@@ -1,0 +1,41 @@
+# Example only — adapt keys to your trainer (Megatron-LM, LLaMA-Factory, torchtitan, etc.)
+#
+# Phase: causal LM continued pretraining on `configs/text/config.json`
+
+model:
+  config_path: ../configs/text/config.json
+  # tokenizer_dir: /path/to/matching/tokenizer  # must match vocab_size in config
+
+optimizer:
+  name: adamw
+  lr: 3.0e-4
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+
+schedule:
+  warmup_ratio: 0.01
+  min_lr_ratio: 0.1
+  # or constant_lr for short runs
+
+training:
+  global_batch_size: 512        # tokens or samples — define in your stack
+  micro_batch_size: 1           # per GPU
+  seq_length: 8192              # start lower (4096) if OOM; raise for long-context CPT
+  max_steps: 100000             # replace with token budget
+  gradient_clipping: 1.0
+  bf16: true
+  gradient_checkpointing: true
+
+data:
+  # binarized / mmap / jsonl — your pipeline
+  train_shards: []
+  val_shards: []
+
+checkpoint:
+  save_every_steps: 2000
+  keep_last_n: 3
+
+distributed:
+  backend: nccl
+  # num_gpus / parallelism strategy is trainer-specific

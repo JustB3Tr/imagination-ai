@@ -27,7 +27,7 @@ def get_task_specs() -> List[TaskSpec]:
     return [
         TaskSpec(
             id=TaskId.CHAT_MAIN,
-            label="Imagination 1.1",
+            label="Imagination 1.2",
             description="Always-on main chat model loaded from the repo root.",
             required_keys=[],
         ),

@@ -76,7 +76,7 @@ os.environ["SKIP_PRELOAD"] = "1"
 !python "/content/drive/MyDrive/imagination-v1.1.0/versions/v1.2/colab_setup.py" --launch
 ```
 
-Use the **Gradio public URL** printed in the output to open the UI.
+Use the **public URL** printed in the output (`* Running on public URL: https://….gradio.live`) to open the UI. `app.py` runs FastAPI + uvicorn but starts the **same Gradio FRP tunnel** as `demo.launch(share=True)` when Colab is detected (or set `GRADIO_SHARE=true` on any machine). Set `GRADIO_SHARE=false` to disable the tunnel.
 
 ### Syncing edits from your F: drive
 

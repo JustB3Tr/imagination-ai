@@ -1,0 +1,10 @@
+{
+  "llm_model": "/content/drive/MyDrive/imagination-v1.1.0",
+  "vision_model": "openai/clip-vit-large-patch14-336",
+  "image_token": "<image>",
+  "image_token_id": 128256,
+  "patch_count": 576,
+  "vision_feature_layer": -2,
+  "llm_hidden": 3072,
+  "vision_hidden": 1024
+}

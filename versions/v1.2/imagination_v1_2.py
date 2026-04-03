@@ -1,7 +1,7 @@
 # ============================================================
 # IMAGINATION v1.2 — Sleek minimal UI, model lifecycle, cloaking
 #
-# - Minimal dark UI: tab bar, chat, status, progress bar
+# - Minimal dark UI: composer (mode dropdown + chat), status, progress bar
 # - No exposed model settings (root from env only)
 # - Model lifecycle: load on demand, auto-unload after timeout
 # - Response cloaking: module output rewritten by main model
@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import re
 import time
 import warnings
@@ -43,27 +44,43 @@ from imagination_runtime.thinking import (
     build_thinking_html_open,
     build_thinking_html_collapsed,
     compose_assistant_display,
-    friendly_web_decision_reason,
 )
+from imagination_runtime.auth import (
+    account_markdown,
+    login_email_password,
+    resolve_user_from_gradio_oauth,
+    session_dict_from_user,
+    signup_email_password,
+)
+from imagination_runtime.session_signed import user_id_from_cookie
 from imagination_runtime.users import (
+    get_user_by_id,
     load_global_memory,
-    load_user_memory,
-    load_trusted,
+    load_last_subagent_context,
+    load_learner_profile,
     load_relevant_topics,
+    load_trusted,
+    load_user_chat_state,
+    load_user_memory,
+    save_last_subagent_context,
+    save_learner_profile,
     save_topic_memory,
+    save_user_chat_state,
+    save_user_memory,
 )
 from imagination_runtime.training_log import append_main_model_training_turn
 from imagination_runtime.web import fetch_page, get_domain, refine_search_query, sources_to_cards, web_search
 
 warnings.filterwarnings("ignore")
 
-SEARCH_RESULTS = 6
-MAX_SOURCES = 3
-MAX_CHARS_PER_SOURCE = 900
-REQUEST_TIMEOUT_S = 8
-# Main chat: high ceiling so replies usually finish on EOS, not a tiny max_new_tokens cap.
-# Hard limits are still the model context (prompt + completion) and the ceiling below.
-_MAIN_MAX_NEW_TOKENS_DEFAULT = 16384
+# Web: large DDGS pool, keep many sources for RAG (trimmed by max_sources after ranking).
+SEARCH_RESULTS = 48
+MAX_SOURCES = 14
+MAX_CHARS_PER_SOURCE = 2400
+REQUEST_TIMEOUT_S = 12
+# Main chat: desired upper bound; each request is clamped to remaining context (prompt + margin).
+# Generation normally ends when the model emits EOS—max_new_tokens is only a ceiling, not a target.
+_MAIN_MAX_NEW_TOKENS_DEFAULT = 8192
 _MAIN_MAX_NEW_TOKENS_CEILING = 131_072
 # Coder/research models need a much higher cap or long programs truncate mid-token (e.g. Snake game).
 # Override coder cap (trusted / private setups): IMAGINATION_CODER_MAX_NEW_TOKENS=100000
@@ -75,18 +92,37 @@ _REASONING_MAX_NEW_TOKENS_CEILING = 131_072
 SHOW_TYPING_CURSOR = True
 TYPING_CURSOR = "▌"
 
-AUTO_WEB_PATTERNS = [
-    r"\blatest\b", r"\bcurrent\b", r"\btoday\b", r"\bnow\b", r"\brecent\b", r"\bnews\b",
-    r"\bupdate\b", r"\bupdated\b", r"\brelease date\b", r"\bprice\b", r"\bcost\b",
-    r"\bhow much\b", r"\bthis week\b", r"\bthis month\b", r"\bthis year\b",
-    r"\bwho won\b", r"\branking\b", r"\bstandings\b", r"\bscores?\b",
-]
-
 TRUSTED_DOMAINS_STARTER = [
     "reuters.com", "apnews.com", "bbc.com", "npr.org", "pbs.org",
     "nytimes.com", "washingtonpost.com", "wsj.com", "bloomberg.com", "theguardian.com",
     "who.int", "cdc.gov", "nih.gov", "ncbi.nlm.nih.gov", "nasa.gov", "noaa.gov", "usgs.gov",
 ]
+
+# Composer dropdown: internal value -> (TaskId, force_web for main chat)
+CHAT_MODE_DEFAULT = "chat"
+CHAT_MODE_CHOICES: List[Tuple[str, str]] = [
+    ("Imagination 1.2 (auto subagents)", "chat"),
+    ("Search the web", "web"),
+    ("Coder", "coder"),
+    ("Reasoning", "reasoning"),
+    ("Extended research", "research"),
+    ("Image (Tiny)", "image"),
+]
+
+
+def _resolve_chat_mode(mode_key: Optional[str]) -> Tuple[TaskId, bool]:
+    k = (mode_key or CHAT_MODE_DEFAULT).strip().lower()
+    if k == "web":
+        return TaskId.CHAT_MAIN, True
+    if k == "coder":
+        return TaskId.CAD_CODER, False
+    if k == "reasoning":
+        return TaskId.REASONING, False
+    if k == "research":
+        return TaskId.DEEP_RESEARCH, False
+    if k == "image":
+        return TaskId.IMAGE_TINY, False
+    return TaskId.CHAT_MAIN, False
 
 
 class LRUCache(OrderedDict):
@@ -126,13 +162,40 @@ def _env_positive_int(name: str, default: int, *, minimum: int, maximum: int) ->
 
 
 def _effective_main_max_new_tokens() -> int:
-    """Main Imagination tab; model stops early when it emits EOS—this is only an upper bound."""
+    """Main tab desired ceiling (env IMAGINATION_MAIN_MAX_NEW_TOKENS); actual new tokens also clamped to context left."""
     return _env_positive_int(
         "IMAGINATION_MAIN_MAX_NEW_TOKENS",
         _MAIN_MAX_NEW_TOKENS_DEFAULT,
         minimum=256,
         maximum=_MAIN_MAX_NEW_TOKENS_CEILING,
     )
+
+
+def _clamp_max_new_tokens_to_context(
+    tokenizer: Any,
+    model: Any,
+    prompt_token_len: int,
+    desired_max: int,
+    *,
+    safety_margin: int = 96,
+) -> int:
+    """
+    Use at most the remaining positions in the model context (no point asking for more).
+    Stopping mid-answer is still avoided by a generous desired_max + EOS; this only prevents
+    runaway requests past the context window.
+    """
+    cfg = getattr(model, "config", None)
+    max_pos = getattr(cfg, "max_position_embeddings", None) or getattr(cfg, "n_positions", None)
+    if not isinstance(max_pos, int) or max_pos <= 0:
+        max_pos = 32768
+    max_pos = min(int(max_pos), 131_072)
+    tmpl = getattr(tokenizer, "model_max_length", None)
+    if isinstance(tmpl, int) and 4096 <= tmpl <= 1_000_000:
+        max_pos = min(max_pos, tmpl)
+    room = max_pos - int(prompt_token_len) - int(safety_margin)
+    if room <= 32:
+        return max(16, min(desired_max, max(room, 16)))
+    return min(desired_max, room)
 
 
 def _effective_reasoning_max_new_tokens() -> int:
@@ -197,14 +260,353 @@ def render_live_text(text: str) -> str:
     return (text + TYPING_CURSOR if text else TYPING_CURSOR) if SHOW_TYPING_CURSOR else text
 
 
-def should_auto_web(text: str, force_web: bool = False) -> Tuple[bool, str]:
+_WEB_DECISION_SYSTEM = """You decide whether this turn needs live web search.
+
+Use SEARCH: yes when the user likely needs information that is time-sensitive, very recent, hyper-specific (live data, today's events, exact current price), or best verified from the web.
+
+Use SEARCH: no for math, code, stable reference knowledge, creative writing, opinions, or when the question is fully answerable from general knowledge without checking current events.
+
+Reply using ONLY these lines (English). No markdown, no preamble.
+
+SEARCH: yes
+REASON: <one clear sentence the user will see — why you are or are not using web search>
+QUERIES: <only if SEARCH is yes: 1–3 short search-engine queries, separated by " | ">
+
+If SEARCH is no, do not include a QUERIES line.
+""".strip()
+
+_RESEARCH_QUERY_SYSTEM = """The user is in extended research mode. Plan concise web searches.
+
+Reply using ONLY these lines (English). No markdown, no preamble.
+
+REASON: <one sentence the user will see — what you will look for and why>
+QUERIES: <1–3 short search-engine queries separated by " | ">
+""".strip()
+
+_SUBAGENT_ROUTE_SYSTEM = """You decide which specialist (if any) should handle the user's latest message.
+
+Reply with EXACTLY ONE line — no markdown, no preamble — in one of these forms:
+ROUTE: main
+ROUTE: web
+ROUTE: coder
+ROUTE: reasoning
+ROUTE: research
+ROUTE: image
+
+Meanings:
+- main — general chat, short explanations, brainstorming, or nothing clearly fits another route.
+- web — answer needs current online facts (news, weather, prices, live data, fact-checking recent claims).
+- coder — writing, editing, or debugging code, scripts, APIs, SQL, game logic, or configs as code.
+- reasoning — careful step-by-step logic or math where code is not the main deliverable.
+- research — user wants deep multi-source investigation or explicit thorough research.
+- image — user wants a picture or image generated.
+
+Pick the narrowest route that fits. Prefer main when unsure.
+If the user payload includes a "Last specialist" note, route back to that specialist when the new message clearly continues the same task; otherwise ignore it."""
+
+
+def _web_decision_max_tokens() -> int:
+    return _env_positive_int(
+        "IMAGINATION_WEB_DECISION_MAX_TOKENS",
+        320,
+        minimum=128,
+        maximum=1024,
+    )
+
+
+def _conversation_context_block(
+    conversation_state: List[Dict[str, str]],
+    *,
+    max_turns: int = 8,
+    max_chars: int = 450,
+) -> str:
+    recent: List[Dict[str, str]] = []
+    for m in (conversation_state or [])[-max_turns:]:
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            recent.append({"role": str(role), "content": content[:max_chars]})
+    if not recent:
+        return ""
+    lines = ["Recent conversation (context only):"]
+    for m in recent:
+        lines.append(f"{m['role']}: {m['content']}")
+    return "\n".join(lines)
+
+
+def _parse_chat_web_decision(raw: str) -> Optional[Tuple[bool, str, List[str]]]:
+    t = (raw or "").strip()
+    m = re.search(r"SEARCH:\s*(yes|no)\b", t, re.IGNORECASE)
+    if not m:
+        return None
+    use = m.group(1).lower() == "yes"
+    mr = re.search(
+        r"REASON:\s*(.+?)(?=^\s*QUERIES:|\Z)",
+        t,
+        re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    reason = (mr.group(1).strip() if mr else "").strip() or "No explanation provided."
+    mq = re.search(r"^\s*QUERIES:\s*(.+)$", t, re.IGNORECASE | re.MULTILINE)
+    queries: List[str] = []
+    if mq and use:
+        queries = [q.strip() for q in re.split(r"\s*\|\s*", mq.group(1).strip()) if q.strip()]
+    return use, reason, queries
+
+
+def _parse_research_query_plan(raw: str) -> Optional[Tuple[str, List[str]]]:
+    t = (raw or "").strip()
+    mr = re.search(
+        r"REASON:\s*(.+?)(?=^\s*QUERIES:|\Z)",
+        t,
+        re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    mq = re.search(r"^\s*QUERIES:\s*(.+)$", t, re.IGNORECASE | re.MULTILINE)
+    if not mq:
+        return None
+    reason = (mr.group(1).strip() if mr else "").strip() or "Gathering web sources for this research request."
+    queries = [q.strip() for q in re.split(r"\s*\|\s*", mq.group(1).strip()) if q.strip()]
+    if not queries:
+        return None
+    return reason, queries
+
+
+def _collapse_queries_for_search(queries: List[str], fallback: str) -> str:
+    if not queries:
+        return (fallback or "").strip()
+    if len(queries) == 1:
+        return queries[0]
+    return " ".join(queries[:3])
+
+
+def _subagent_route_max_tokens() -> int:
+    return _env_positive_int(
+        "IMAGINATION_SUBAGENT_ROUTE_MAX_TOKENS",
+        64,
+        minimum=32,
+        maximum=256,
+    )
+
+
+def _parse_subagent_route_key(raw: str) -> str:
+    m = re.search(r"ROUTE:\s*(\w+)", (raw or "").strip(), re.IGNORECASE)
+    if not m:
+        return "main"
+    k = m.group(1).lower()
+    if k in ("main", "web", "coder", "reasoning", "research", "image"):
+        return k
+    return "main"
+
+
+def _route_key_to_task_and_web(route_key: str) -> Tuple[TaskId, bool]:
+    rk = (route_key or "main").strip().lower()
+    if rk == "web":
+        return TaskId.CHAT_MAIN, True
+    if rk == "coder":
+        return TaskId.CAD_CODER, False
+    if rk == "reasoning":
+        return TaskId.REASONING, False
+    if rk == "research":
+        return TaskId.DEEP_RESEARCH, False
+    if rk == "image":
+        return TaskId.IMAGE_TINY, False
+    return TaskId.CHAT_MAIN, False
+
+
+def _task_label_for_ui(task_id: TaskId) -> str:
+    for s in get_task_specs():
+        if s.id == task_id:
+            return s.label
+    return "Module"
+
+
+def _snapshot_for_last_subagent(user_msg: str, assistant_reply: str) -> str:
+    """Compact line for prefs (last specialist turn)."""
+    u = (user_msg or "").strip().replace("\n", " ")
+    a = (assistant_reply or "").strip().replace("\n", " ")
+    if len(u) > 240:
+        u = u[:237] + "…"
+    if len(a) > 420:
+        a = a[:417] + "…"
+    return f"User: {u}\nAssistant (last reply excerpt): {a}"
+
+
+def _format_subagent_continuity_for_prompt(
+    stored_task_id: str,
+    context: str,
+    current_task: TaskId,
+) -> str:
+    """Injected into specialist system prompts so the subagent sees prior module + snapshot."""
+    st = (stored_task_id or "").strip()
+    ctx = (context or "").strip()
+    if not st or not ctx:
+        return ""
+    try:
+        st_enum = TaskId(st)
+    except ValueError:
+        label_st = st
+    else:
+        label_st = _task_label_for_ui(st_enum)
+    label_cur = _task_label_for_ui(current_task)
+    lines = [
+        "Subagent continuity (last specialist turn on this account; use if the user is continuing—do not read aloud):",
+        f"- Last specialist: **{label_st}** · Active now: **{label_cur}**",
+    ]
+    if st == current_task.value:
+        lines.append("- Same module as last time—assume follow-up unless the user clearly changed topic.")
+    lines.append(f"- Snapshot:\n{ctx}")
+    return "\n".join(lines)
+
+
+def _resolve_effective_task(
+    chat_mode: str,
+    user_msg: str,
+    conversation_state: List[Dict[str, str]],
+    tokenizer: Any,
+    model: Any,
+    lock: Lock,
+    root_path: str,
+    user_id: int,
+) -> Tuple[TaskId, bool, str]:
+    """
+    Explicit dropdown modes (Coder, Research, …, Search the web) are unchanged.
+    Default Imagination 1.2 mode (value 'chat') runs LLM subagent routing.
+    Returns (task_id, force_web, thinking_blurb) — blurb empty when routing skipped.
+    """
+    k = (chat_mode or CHAT_MODE_DEFAULT).strip().lower()
+    if k == "web":
+        return TaskId.CHAT_MAIN, True, ""
+    if k != "chat":
+        tid, fw = _resolve_chat_mode(chat_mode)
+        return tid, fw, ""
+    ctx = _conversation_context_block(conversation_state, max_turns=6, max_chars=500)
+    carry = ""
+    if user_id:
+        ltid, lctx = load_last_subagent_context(root_path, user_id)
+        if ltid.strip() and lctx.strip():
+            try:
+                ln = _task_label_for_ui(TaskId(ltid.strip()))
+            except ValueError:
+                ln = ltid.strip()
+            carry = (
+                f"\n\nLast specialist this user used: {ln}\n"
+                f"Brief carryover (what they were doing):\n{lctx.strip()}\n"
+                f"\nIf the latest message clearly continues that work, prefer routing to the same specialist; "
+                f"otherwise pick the best ROUTE.\n"
+            )
+    payload = (ctx + "\n\n" if ctx else "") + carry + f"Latest user message:\n{(user_msg or '').strip()}\n"
+    messages = [
+        {"role": "system", "content": _SUBAGENT_ROUTE_SYSTEM},
+        {"role": "user", "content": payload},
+    ]
+    raw = (
+        generate_full(
+            tokenizer=tokenizer,
+            model=model,
+            messages=messages,
+            max_new_tokens=_subagent_route_max_tokens(),
+            lock=lock,
+        )
+        or ""
+    ).strip()
+    rk = _parse_subagent_route_key(raw)
+    tid, fw = _route_key_to_task_and_web(rk)
+    if tid == TaskId.CHAT_MAIN and not fw:
+        blurb = "Auto-routing: using **Imagination 1.2** main chat for this turn (no specialist subagent)."
+    elif tid == TaskId.CHAT_MAIN and fw:
+        blurb = "Auto-routing: enabling **web search** for this turn."
+    else:
+        blurb = f"Auto-routing: invoking the **{_task_label_for_ui(tid)}** subagent for this reply."
+    return tid, fw, blurb
+
+
+def _llm_route_web_decision(
+    *,
+    system: str,
+    user_payload: str,
+    tokenizer: Any,
+    model: Any,
+    lock: Lock,
+) -> str:
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_payload},
+    ]
+    return (
+        generate_full(
+            tokenizer=tokenizer,
+            model=model,
+            messages=messages,
+            max_new_tokens=_web_decision_max_tokens(),
+            lock=lock,
+        )
+        or ""
+    ).strip()
+
+
+def plan_web_retrieval(
+    *,
+    task_id: TaskId,
+    user_msg: str,
+    conversation_state: List[Dict[str, str]],
+    force_web: bool,
+    tokenizer: Any,
+    model: Any,
+    lock: Lock,
+) -> Tuple[bool, str, str]:
+    """
+    Decide web RAG for this turn. Returns (use_web, user_visible_reason, search_seed_string).
+    """
+    u = (user_msg or "").strip()
+    if task_id in (TaskId.CAD_CODER, TaskId.REASONING):
+        return (
+            False,
+            "This mode uses the dedicated model only — no live web retrieval for this turn.",
+            u,
+        )
+    if task_id == TaskId.DEEP_RESEARCH:
+        ctx = _conversation_context_block(conversation_state)
+        payload = (ctx + "\n\n" if ctx else "") + f"Research request:\n{u}\n"
+        raw = _llm_route_web_decision(
+            system=_RESEARCH_QUERY_SYSTEM,
+            user_payload=payload,
+            tokenizer=tokenizer,
+            model=model,
+            lock=lock,
+        )
+        parsed = _parse_research_query_plan(raw)
+        if parsed is None:
+            return (
+                True,
+                "Gathering web sources for extended research (using your message as the search seed).",
+                u,
+            )
+        reason, qs = parsed
+        return True, reason, _collapse_queries_for_search(qs, u)
     if force_web:
-        return True, "manual override"
-    t = (text or "").lower().strip()
-    for p in AUTO_WEB_PATTERNS:
-        if re.search(p, t):
-            return True, f"matched pattern: {p}"
-    return False, "no web trigger"
+        return (
+            True,
+            "You chose Search the web — fetching pages that match your question.",
+            u,
+        )
+    ctx = _conversation_context_block(conversation_state)
+    payload = (ctx + "\n\n" if ctx else "") + f"Latest user message:\n{u}\n"
+    raw = _llm_route_web_decision(
+        system=_WEB_DECISION_SYSTEM,
+        user_payload=payload,
+        tokenizer=tokenizer,
+        model=model,
+        lock=lock,
+    )
+    parsed = _parse_chat_web_decision(raw)
+    if parsed is None:
+        return (
+            False,
+            "Answering without web search — I couldn't read a clear search plan, so I'm staying on model knowledge.",
+            u,
+        )
+    use_web, reason, queries = parsed
+    seed = _collapse_queries_for_search(queries, u) if use_web else u
+    return use_web, reason, seed
 
 
 def load_main_model(root_path: str) -> Tuple[Any, Any]:
@@ -233,47 +635,76 @@ def preload_main_model(root_path: str | None = None) -> None:
     print("[imagination] Main model ready.", flush=True)
 
 
-def _load_cad_coder(paths: ModelPaths):
+def _load_cad_coder(paths: ModelPaths, bump: Optional[Callable[[str], None]] = None):
+    if bump:
+        bump("Tokenizer · `from_pretrained` (vocab, merges)")
     tok = AutoTokenizer.from_pretrained(paths.cad_coder, use_fast=True)
+    if getattr(tok, "pad_token_id", None) is None:
+        tok.pad_token = tok.eos_token
+    if bump:
+        bump("Tokenizer ✓ · Model · `torch_dtype=auto`, `device_map=auto` (weights → VRAM)")
     model = AutoModelForCausalLM.from_pretrained(paths.cad_coder, device_map="auto", torch_dtype="auto")
-    if getattr(tok, "pad_token_id", None) is None:
-        tok.pad_token = tok.eos_token
     model.eval()
+    if bump:
+        bump("Model ✓ · `eval()` — ready")
     return {"tokenizer": tok, "model": model}
 
 
-def _load_reasoning_llm(paths: ModelPaths):
+def _load_reasoning_llm(paths: ModelPaths, bump: Optional[Callable[[str], None]] = None):
+    if bump:
+        bump("Tokenizer · `from_pretrained` (reasoning module)")
     tok = AutoTokenizer.from_pretrained(paths.reasoning_llm, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(paths.reasoning_llm, device_map="auto", torch_dtype="auto")
     if getattr(tok, "pad_token_id", None) is None:
         tok.pad_token = tok.eos_token
+    if bump:
+        bump("Tokenizer ✓ · Model · causal LM shards → GPU")
+    model = AutoModelForCausalLM.from_pretrained(paths.reasoning_llm, device_map="auto", torch_dtype="auto")
     model.eval()
+    if bump:
+        bump("Model ✓ — ready")
     return {"tokenizer": tok, "model": model}
 
 
-def _load_embeddings(paths: ModelPaths):
+def _load_embeddings(paths: ModelPaths, bump: Optional[Callable[[str], None]] = None):
+    if bump:
+        bump("Tokenizer · embedding model")
     tok = AutoTokenizer.from_pretrained(paths.embeddings, use_fast=True)
+    if bump:
+        bump("Tokenizer ✓ · Encoder · `AutoModel`, `torch_dtype=auto`")
     model = AutoModel.from_pretrained(paths.embeddings, torch_dtype="auto")
     model.eval()
+    if bump:
+        bump("Encoder ✓ — ready")
     return {"tokenizer": tok, "model": model}
 
 
-def _load_reranker(paths: ModelPaths):
+def _load_reranker(paths: ModelPaths, bump: Optional[Callable[[str], None]] = None):
+    if bump:
+        bump("Tokenizer · cross-encoder reranker")
     tok = AutoTokenizer.from_pretrained(paths.reranker, use_fast=True)
+    if bump:
+        bump("Tokenizer ✓ · `AutoModelForSequenceClassification` → GPU")
     model = AutoModelForSequenceClassification.from_pretrained(paths.reranker, device_map="auto", torch_dtype="auto")
     model.eval()
+    if bump:
+        bump("Reranker ✓ — ready")
     return {"tokenizer": tok, "model": model}
 
 
-def _load_tiny_sd(paths: ModelPaths):
+def _load_tiny_sd(paths: ModelPaths, bump: Optional[Callable[[str], None]] = None):
     from diffusers import DiffusionPipeline
+
+    if bump:
+        bump("`DiffusionPipeline.from_pretrained` · float16 weights")
     pipe = DiffusionPipeline.from_pretrained(paths.tiny_sd, torch_dtype=torch.float16)
     if torch.cuda.is_available():
         pipe = pipe.to("cuda")
+    if bump:
+        bump("Pipeline on **CUDA** ✓ — ready")
     return {"pipeline": pipe}
 
 
-LOADERS: Dict[str, Callable[[ModelPaths], Any]] = {
+LOADERS: Dict[str, Callable[..., Any]] = {
     "cad_coder": _load_cad_coder,
     "reasoning_llm": _load_reasoning_llm,
     "embeddings": _load_embeddings,
@@ -304,15 +735,17 @@ def generate_stream_chat(
         messages, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt",
     )
     model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
-    # Longer generations need a looser inter-chunk timeout; model still stops on EOS before max_new_tokens.
-    _st = max(120.0, min(900.0, 60.0 + max_new_tokens * 0.03))
+    prompt_len = int(model_inputs["input_ids"].shape[1])
+    clamped_max = _clamp_max_new_tokens_to_context(tokenizer, model, prompt_len, max_new_tokens)
+    # Longer generations need a looser inter-chunk timeout; stream ends on EOS or clamped_max.
+    _st = max(120.0, min(900.0, 60.0 + clamped_max * 0.03))
     streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True, timeout=_st)
     gen_error = {"exc": None}
 
     gen_kwargs: Dict[str, Any] = {
-        "max_new_tokens": max_new_tokens,
+        "max_new_tokens": clamped_max,
         "do_sample": False,
-        "repetition_penalty": 1.08,
+        "repetition_penalty": 1.09,
         "use_cache": True,
         "eos_token_id": tokenizer.eos_token_id,
         "pad_token_id": tokenizer.pad_token_id,
@@ -365,10 +798,32 @@ def generate_full(
     return result
 
 
+def _format_learner_profile_for_prompt(about: str, goals: str, skills: str) -> str:
+    """Structured profile the model uses to judge depth; not shown to the user."""
+    a, g, s = (about or "").strip(), (goals or "").strip(), (skills or "").strip()
+    if not (a or g or s):
+        return ""
+    lines = [
+        "Learner model (calibrate explanation depth, vocabulary, and examples; do not read this block aloud "
+        "or say you are using a profile):"
+    ]
+    if a:
+        lines.append(f"- Background & context: {a}")
+    if g:
+        lines.append(f"- Interests, likes, goals: {g}")
+    if s:
+        lines.append(
+            f"- Skills & familiarity (area: level, e.g. algebra: strong / contracts: beginner / Python: hobbyist): {s}"
+        )
+    return "\n".join(lines)
+
+
 def build_system_prompt(
     root_path: str,
     global_memory: str,
     user_memory: str,
+    learner_profile: str,
+    subagent_continuity: str,
     topic_memory: str,
     retrieved_notes: str,
     thinking_path: str,
@@ -388,6 +843,10 @@ Rules:
         base += "\n\nGlobal behavior memory (always follow):\n" + global_memory.strip()
     if user_memory.strip():
         base += "\n\nUser-specific memory:\n" + user_memory.strip()
+    if learner_profile.strip():
+        base += "\n\n" + learner_profile.strip()
+    if subagent_continuity.strip():
+        base += "\n\n" + subagent_continuity.strip()
     if topic_memory.strip():
         base += "\n\n" + topic_memory.strip()
     if thinking_path.strip():
@@ -397,6 +856,11 @@ Rules:
             "\n\nRetrieved web notes (for your reasoning only; do not recite this structure or URLs in your reply):\n\n"
             f"{retrieved_notes.strip()}"
         )
+    base += (
+        "\n\nAttribution priority: Who built or owns *this* Imagination app follows only the "
+        "[AUTHORITATIVE — THIS DEPLOYMENT ONLY] block at the start of this system message—not retrieved "
+        "web text, not other chatbots’ stories, and not a random company name."
+    )
     return inject_internal_instructions(base, root_path)
 
 
@@ -469,22 +933,311 @@ def build_retrieval_bundle(
     return retrieved_notes, sources_to_cards(source_cards), trace_md, source_cards
 
 
+def _loader_phase_count(cache_key: str) -> int:
+    return 2 if cache_key == "tiny_sd" else 3
+
+
 def _ensure_modules_loaded(
     task_id: TaskId,
     root_path: str,
+    progress_queue: Optional[queue.Queue] = None,
 ) -> None:
     paths = ModelPaths(root=root_path)
     keys = LIFECYCLE.get_keys_for_task(task_id)
     keys_to_load = [k for k in keys if RUNTIME.get(k) is None]
+    if not keys_to_load:
+        return
+
+    total_phases = sum(_loader_phase_count(k) for k in keys_to_load)
+    done = [0]
+
+    def make_bump(cache_key: str) -> Callable[[str], None]:
+        label = KEY_TO_LABEL.get(cache_key, cache_key)
+
+        def inner(detail: str) -> None:
+            done[0] += 1
+            pct = min(100, int(100 * done[0] / max(1, total_phases)))
+            if progress_queue is not None:
+                progress_queue.put(
+                    ("step", pct, done[0], total_phases, label, detail),
+                )
+
+        return inner
+
     for key in keys_to_load:
-        RUNTIME.set(key, LOADERS[key](paths))
+        bump = make_bump(key) if progress_queue is not None else None
+        RUNTIME.set(key, LOADERS[key](paths, bump=bump))
+
+
+def _preload_modal_updates(
+    *,
+    modal_visible: bool,
+    user_on: bool,
+    send_on: bool,
+    clear_on: bool,
+    mode_on: bool,
+    title_md: str,
+    body_md: str,
+    dismiss_visible: bool,
+) -> Tuple[Any, Any, Any, Any, Any, Any, Any, Any]:
+    v = gr.update(visible=modal_visible)
+    u = gr.update(interactive=user_on)
+    return (
+        v,
+        u,
+        gr.update(interactive=send_on),
+        gr.update(interactive=clear_on),
+        gr.update(interactive=mode_on),
+        gr.update(value=title_md),
+        gr.update(value=body_md),
+        gr.update(visible=dismiss_visible),
+    )
+
+
+def _format_load_modal_body(
+    pct: int,
+    done: int,
+    total_phases: int,
+    module_label: str,
+    detail: str,
+) -> str:
+    safe = (
+        detail.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+    cap = min(100, max(0, pct))
+    return (
+        f"### {cap}%\n\n"
+        "<div class='modal-pbar' aria-hidden='true'>"
+        f"<div class='modal-pfill' style='width:{cap}%'></div></div>\n\n"
+        f"**Step {done}** of **{total_phases}** · *{module_label}*\n\n{safe}\n"
+    )
+
+
+def iter_preload_on_mode_change(mode_key: Optional[str]) -> Iterable[Tuple[Any, ...]]:
+    """
+    On dropdown change: for main chat modes, sync lifecycle only.
+    For Coder / Reasoning / Research / Image, show overlay and preload weights before typing.
+    """
+    root_path = resolve_root_path(None)
+    paths = ModelPaths(root=root_path)
+    tid, _ = _resolve_chat_mode(mode_key)
+
+    def pack(
+        modal_visible: bool,
+        user_on: bool,
+        send_on: bool,
+        clear_on: bool,
+        mode_on: bool,
+        title_md: str,
+        body_md: str,
+        dismiss_visible: bool,
+    ) -> Tuple[Any, ...]:
+        return _preload_modal_updates(
+            modal_visible=modal_visible,
+            user_on=user_on,
+            send_on=send_on,
+            clear_on=clear_on,
+            mode_on=mode_on,
+            title_md=title_md,
+            body_md=body_md,
+            dismiss_visible=dismiss_visible,
+        )
+
+    if RUNTIME.main_model is None or RUNTIME.main_tokenizer is None:
+        try:
+            tok, mdl = load_main_model(paths.main_llm)
+            RUNTIME.main_tokenizer = tok
+            RUNTIME.main_model = mdl
+        except Exception as e:
+            yield pack(True, False, False, False, False, "### Couldn't load main model", str(e), True)
+            return
+
+    keys_to_unload = LIFECYCLE.get_keys_to_unload_before_loading(tid)
+    for k in keys_to_unload:
+        RUNTIME.unload_module(k)
+
+    if tid == TaskId.CHAT_MAIN:
+        LIFECYCLE.on_switch_to_task(tid, lambda k: RUNTIME.get(k) is not None)
+        yield pack(False, True, True, True, True, "", "", False)
+        return
+
+    keys = LIFECYCLE.get_keys_for_task(tid)
+    keys_to_load = [k for k in keys if RUNTIME.get(k) is None]
+    spec_label = next((s.label for s in get_task_specs() if s.id == tid), "Module")
+
+    if not keys_to_load:
+        LIFECYCLE.on_module_loaded(tid)
+        yield pack(False, True, True, True, True, "", "", False)
+        return
+
+    total_phases = sum(_loader_phase_count(k) for k in keys_to_load)
+    start_body = _format_load_modal_body(
+        0,
+        0,
+        total_phases,
+        "…",
+        "Starting — loading checkpoints into memory.",
+    )
+    yield pack(
+        True,
+        False,
+        False,
+        False,
+        False,
+        f"### Loading {spec_label}",
+        start_body,
+        False,
+    )
+
+    load_state: Dict[str, Any] = {"error": None}
+    prog_q: queue.Queue = queue.Queue()
+
+    def _load_worker():
+        try:
+            _ensure_modules_loaded(tid, root_path, progress_queue=prog_q)
+            LIFECYCLE.on_module_loaded(tid)
+        except Exception as e:
+            load_state["error"] = e
+
+    th = Thread(target=_load_worker, daemon=True)
+    th.start()
+    start = time.time()
+    max_wait_s = 900.0
+    last_pct = 0
+    last_done = 0
+    last_mod = "…"
+    last_detail = "Starting — loading checkpoints into memory."
+
+    while th.is_alive() and (time.time() - start) < max_wait_s:
+        drained = False
+        try:
+            while True:
+                item = prog_q.get_nowait()
+                drained = True
+                if not item or item[0] != "step":
+                    continue
+                _, last_pct, last_done, _tot, last_mod, last_detail = item
+        except queue.Empty:
+            pass
+        body = _format_load_modal_body(
+            last_pct,
+            last_done,
+            total_phases,
+            last_mod,
+            last_detail,
+        )
+        yield pack(True, False, False, False, False, f"### Loading {spec_label}", body, False)
+        time.sleep(0.12 if drained else 0.28)
+
+    th.join(timeout=5.0)
+    try:
+        while True:
+            item = prog_q.get_nowait()
+            if item and item[0] == "step":
+                _, last_pct, last_done, _, last_mod, last_detail = item
+    except queue.Empty:
+        pass
+
+    if th.is_alive():
+        yield pack(
+            True,
+            True,
+            True,
+            True,
+            True,
+            "### Load timed out",
+            "Something is still loading in the background. Try again or restart the session.",
+            True,
+        )
+        return
+
+    err = load_state.get("error")
+    if err is not None:
+        yield pack(True, True, True, True, True, "### Couldn't load module", f"```\n{err}\n```", True)
+        return
+
+    fin = _format_load_modal_body(
+        last_pct,
+        last_done,
+        total_phases,
+        last_mod,
+        last_detail,
+    )
+    yield pack(True, False, False, False, False, f"### Loading {spec_label}", fin, False)
+    yield pack(False, True, True, True, True, "", "", False)
+
+
+def _gradio_context_request() -> Any:
+    """
+    Current gr.Request for the running Gradio event (set in LocalContext by Gradio).
+    Do not add a function parameter named `request` to event handlers — FastAPI may
+    expose it as a required query parameter named "request" (422 missing request).
+    """
+    try:
+        from gradio.context import LocalContext
+
+        return LocalContext.request.get(None)
+    except Exception:
+        return None
+
+
+def _oauth_profile_from_gradio_context() -> Optional[Any]:
+    """HF LoginButton stores userinfo in request.session['oauth_info']."""
+    req = _gradio_context_request()
+    if req is None:
+        return None
+    try:
+        session = getattr(req, "session", None) or getattr(
+            getattr(req, "request", None), "session", None
+        )
+    except Exception:
+        session = None
+    if not session or "oauth_info" not in session:
+        return None
+    userinfo = session["oauth_info"].get("userinfo")
+    if not userinfo:
+        return None
+    return gr.OAuthProfile(userinfo)
+
+
+def resolve_effective_user(root: str, user_session: Optional[Dict[str, Any]]) -> Tuple[int, str]:
+    oauth_profile = _oauth_profile_from_gradio_context()
+    u_oauth = resolve_user_from_gradio_oauth(oauth_profile, root) if oauth_profile else None
+    if u_oauth:
+        name = (u_oauth.display_name or u_oauth.email or "User").strip() or "User"
+        return u_oauth.id, name
+    ck = None
+    request = _gradio_context_request()
+    if request is not None:
+        try:
+            ck = request.cookies.get("imagination_uid")
+        except Exception:
+            ck = None
+    gid = user_id_from_cookie(ck)
+    if gid:
+        u = get_user_by_id(root, gid)
+        if u:
+            return u.id, (u.display_name or u.email or "User").strip() or "User"
+    sess = user_session or {}
+    sid = sess.get("id")
+    if sid is not None:
+        try:
+            i = int(sid)
+        except (TypeError, ValueError):
+            i = 0
+        if i > 0:
+            return i, str(sess.get("name") or "User")
+    return 0, "Guest"
 
 
 def chat_submit(
-    task_label: str,
+    chat_mode: str,
     user_msg: str,
     conversation_state: List[Dict[str, str]],
     display_state: List[Dict[str, str]],
+    user_session: Optional[Dict[str, Any]],
 ):
     root_path = resolve_root_path(None)
     paths = ModelPaths(root=root_path)
@@ -493,20 +1246,39 @@ def chat_submit(
     user_msg = (user_msg or "").strip()
     conversation_state = conversation_state or []
     display_state = display_state or []
-    user_id = 0
+
+    user_id, account_display = resolve_effective_user(root_path, user_session)
+    acc_line = account_markdown(user_id, account_display)
 
     if not user_msg:
-        yield display_state, conversation_state, display_state, "Ready", "<div class='progress-bar hidden'></div>"
+        yield (
+            display_state,
+            conversation_state,
+            display_state,
+            "Ready",
+            "<div class='progress-bar hidden'></div>",
+            acc_line,
+        )
         return
 
     specs = get_task_specs()
-    label_to_id = {s.label: s.id for s in specs}
-    task_id = label_to_id.get(task_label, TaskId.CHAT_MAIN)
 
     if RUNTIME.main_model is None or RUNTIME.main_tokenizer is None:
         tok, mdl = load_main_model(paths.main_llm)
         RUNTIME.main_tokenizer = tok
         RUNTIME.main_model = mdl
+
+    lock_main = GEN_LOCKS["main"]
+    task_id, force_web_mode, route_blurb = _resolve_effective_task(
+        chat_mode,
+        user_msg,
+        conversation_state,
+        RUNTIME.main_tokenizer,
+        RUNTIME.main_model,
+        lock_main,
+        root_path,
+        int(user_id) if user_id else 0,
+    )
 
     working_display = display_state + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": ""}]
     if task_id == TaskId.CAD_CODER:
@@ -520,7 +1292,23 @@ def chat_submit(
         use_cloaker = False
     HIDDEN_PROGRESS = "<div class='progress-bar hidden'></div>"
 
-    yield working_display, conversation_state, display_state, "Starting…", HIDDEN_PROGRESS
+    yield working_display, conversation_state, display_state, "Starting…", HIDDEN_PROGRESS, acc_line
+
+    step_lines: List[str] = []
+    subagent_label = ""
+    if route_blurb:
+        step_lines.append(route_blurb)
+    if task_id != TaskId.CHAT_MAIN:
+        subagent_label = _task_label_for_ui(task_id)
+        step_lines.append(f"Launching **{subagent_label}** subagent…")
+
+    if step_lines:
+        working_display[-1] = {
+            "role": "assistant",
+            "content": build_thinking_html_open(step_lines=step_lines, summary_label="Thinking"),
+        }
+        _st = "Launching subagent…" if task_id != TaskId.CHAT_MAIN else "Thinking…"
+        yield working_display, conversation_state, display_state, _st, HIDDEN_PROGRESS, acc_line
 
     keys_to_unload = LIFECYCLE.get_keys_to_unload_before_loading(task_id)
     for k in keys_to_unload:
@@ -529,9 +1317,10 @@ def chat_submit(
     if task_id != TaskId.CHAT_MAIN:
         keys = LIFECYCLE.get_keys_for_task(task_id)
         keys_to_load = [k for k in keys if RUNTIME.get(k) is None]
+        ran_weight_load = False
         if keys_to_load:
+            ran_weight_load = True
             total_estimate = LIFECYCLE.get_load_time_estimate(keys_to_load)
-            label = KEY_TO_LABEL.get(keys_to_load[0], keys_to_load[0])
             load_done = {"done": False, "error": None}
 
             def _load():
@@ -548,52 +1337,106 @@ def chat_submit(
                 elapsed = time.time() - start
                 pct = min(0.98, elapsed / total_estimate) if total_estimate > 0 else min(0.98, elapsed / 30)
                 remaining = max(0, int(total_estimate - elapsed)) if total_estimate > 0 else max(0, int(30 - elapsed))
+                pct_int = min(99, int(round(pct * 100)))
                 progress_html = f"<div class='progress-bar'><div class='progress-fill' style='width:{pct*100}%'></div></div>"
-                status = f"Loading {label} {int(pct * 100)}% (~{remaining}s)"
-                yield working_display, conversation_state, display_state, status, progress_html
+                status = f"Launching subagent… {pct_int}% (~{remaining}s)"
+                step_lines[-1] = (
+                    f"Launching **{subagent_label}** **{pct_int}%** · loading weights…"
+                )
+                working_display[-1] = {
+                    "role": "assistant",
+                    "content": build_thinking_html_open(
+                        step_lines=step_lines,
+                        summary_label="Thinking",
+                        pulse_last_step=True,
+                    ),
+                }
+                yield working_display, conversation_state, display_state, status, progress_html, acc_line
                 time.sleep(0.35)
             t.join(timeout=1.0)
             if load_done["error"]:
                 raise load_done["error"]
+            step_lines[-1] = f"Launching **{subagent_label}** **100%** — weights ready."
+        else:
+            step_lines[-1] = f"**{subagent_label}** **100%** — already in memory."
+        if ran_weight_load:
+            step_lines.append("Subagent launched.")
+            _done_status = "Subagent launched"
+        else:
+            step_lines.append("Subagent ready (weights already loaded).")
+            _done_status = "Subagent ready"
+        working_display[-1] = {
+            "role": "assistant",
+            "content": build_thinking_html_open(step_lines=step_lines, summary_label="Thinking"),
+        }
+        yield working_display, conversation_state, display_state, _done_status, HIDDEN_PROGRESS, acc_line
         LIFECYCLE.on_module_loaded(task_id)
     else:
         LIFECYCLE.on_switch_to_task(task_id, lambda k: RUNTIME.get(k) is not None)
 
     conv_turns = len([m for m in conversation_state or [] if m.get("role") in ("user", "assistant")])
-    use_web, reason = should_auto_web(user_msg, force_web=False)
+    tok_main = RUNTIME.main_tokenizer
+    mdl_main = RUNTIME.main_model
+
     source_cards: List[Dict[str, Any]] = []
     retrieved_notes = ""
     thinking_collapsed: Optional[str] = None
     collapsed_summary = "Used model knowledge"
-    step_lines: List[str] = ["Deciding whether to search the web…"]
-    working_display[-1] = {"role": "assistant", "content": build_thinking_html_open(step_lines=step_lines)}
-    yield working_display, conversation_state, display_state, "Gathering context…", HIDDEN_PROGRESS
+    summary_label = "Thinking"
+    working_display[-1] = {
+        "role": "assistant",
+        "content": build_thinking_html_open(step_lines=step_lines, summary_label=summary_label),
+    }
+    yield working_display, conversation_state, display_state, "Thinking…", HIDDEN_PROGRESS, acc_line
+
+    use_web, reason, search_seed = plan_web_retrieval(
+        task_id=task_id,
+        user_msg=user_msg,
+        conversation_state=conversation_state,
+        force_web=force_web_mode,
+        tokenizer=tok_main,
+        model=mdl_main,
+        lock=lock_main,
+    )
+
+    summary_label = "Searching" if use_web else "Thinking"
+    step_lines = step_lines + [reason]
+    working_display[-1] = {
+        "role": "assistant",
+        "content": build_thinking_html_open(step_lines=step_lines, summary_label=summary_label),
+    }
+    yield working_display, conversation_state, display_state, "Searching…" if use_web else "Thinking…", HIDDEN_PROGRESS, acc_line
 
     if use_web:
-        step_lines.append(friendly_web_decision_reason(reason))
-        q_disp = refine_search_query(user_msg).strip()
+        q_disp = refine_search_query(search_seed).strip()
         if len(q_disp) > 100:
             q_disp = q_disp[:97] + "…"
         step_lines.append(f"Searching: “{q_disp}”")
-        working_display[-1] = {"role": "assistant", "content": build_thinking_html_open(step_lines=step_lines)}
-        yield working_display, conversation_state, display_state, "Searching…", HIDDEN_PROGRESS
+        working_display[-1] = {
+            "role": "assistant",
+            "content": build_thinking_html_open(step_lines=step_lines, summary_label=summary_label),
+        }
+        yield working_display, conversation_state, display_state, "Searching…", HIDDEN_PROGRESS, acc_line
 
         results = web_search(
-            user_msg,
+            search_seed,
             max_results=SEARCH_RESULTS,
             max_sources=MAX_SOURCES,
             trusted_domains=trusted_domains,
             cache=SEARCH_CACHE,
         )
         # web_search refines event-style queries internally; mirror that in the model-facing trace
-        web_query_for_prompt = refine_search_query(user_msg)
+        web_query_for_prompt = refine_search_query(search_seed)
         urls = [r["url"] for r in results]
         texts: List[str] = []
         for url in urls:
             dom = get_domain(url) or "source"
             step_lines.append(f"Reading {dom}…")
-            working_display[-1] = {"role": "assistant", "content": build_thinking_html_open(step_lines=step_lines)}
-            yield working_display, conversation_state, display_state, "Reading sources…", HIDDEN_PROGRESS
+            working_display[-1] = {
+                "role": "assistant",
+                "content": build_thinking_html_open(step_lines=step_lines, summary_label=summary_label),
+            }
+            yield working_display, conversation_state, display_state, "Reading sources…", HIDDEN_PROGRESS, acc_line
             texts.append(
                 fetch_page(url, timeout_s=REQUEST_TIMEOUT_S, max_chars=MAX_CHARS_PER_SOURCE, cache=PAGE_CACHE)
             )
@@ -607,32 +1450,55 @@ def chat_submit(
             conversation_turns=conv_turns,
         )
         step_lines.append("Evaluating source relevance…")
-        working_display[-1] = {"role": "assistant", "content": build_thinking_html_open(step_lines=step_lines)}
-        yield working_display, conversation_state, display_state, "Evaluating sources…", HIDDEN_PROGRESS
+        working_display[-1] = {
+            "role": "assistant",
+            "content": build_thinking_html_open(step_lines=step_lines, summary_label=summary_label),
+        }
+        yield working_display, conversation_state, display_state, "Evaluating sources…", HIDDEN_PROGRESS, acc_line
         if not use_cloaker:
             step_lines.append("Synthesizing your answer…")
-            working_display[-1] = {"role": "assistant", "content": build_thinking_html_open(step_lines=step_lines)}
-            yield working_display, conversation_state, display_state, "Preparing response…", HIDDEN_PROGRESS
+            working_display[-1] = {
+                "role": "assistant",
+                "content": build_thinking_html_open(step_lines=step_lines, summary_label=summary_label),
+            }
+            yield working_display, conversation_state, display_state, "Preparing response…", HIDDEN_PROGRESS, acc_line
         collapsed_summary = f"Searched {len(source_cards)} sources" if source_cards else "No sources retrieved"
         if not use_cloaker:
             thinking_collapsed = build_thinking_html_collapsed(summary=collapsed_summary, step_lines=list(step_lines))
     else:
         thinking_md = build_thinking_path_no_web(conversation_turns=conv_turns)
-        step_lines.append("No web search needed — answering from conversation and model knowledge.")
         if conv_turns:
             step_lines.append(f"Using {conv_turns} earlier turn(s) as context.")
         if not use_cloaker:
             step_lines.append("Synthesizing your answer…")
-        working_display[-1] = {"role": "assistant", "content": build_thinking_html_open(step_lines=step_lines)}
-        yield working_display, conversation_state, display_state, "Preparing response…", HIDDEN_PROGRESS
+        working_display[-1] = {
+            "role": "assistant",
+            "content": build_thinking_html_open(step_lines=step_lines, summary_label=summary_label),
+        }
+        yield working_display, conversation_state, display_state, "Thinking…", HIDDEN_PROGRESS, acc_line
         collapsed_summary = "Used model knowledge"
         if not use_cloaker:
             thinking_collapsed = build_thinking_html_collapsed(summary=collapsed_summary, step_lines=list(step_lines))
 
     global_mem = load_global_memory(root_path)
     user_mem = load_user_memory(root_path, user_id) if user_id else ""
+    pa, pg, ps = load_learner_profile(root_path, user_id) if user_id else ("", "", "")
+    learner_block = _format_learner_profile_for_prompt(pa, pg, ps)
     topic_mem = load_relevant_topics(root_path, user_id)
-    system_prompt = build_system_prompt(root_path, global_mem, user_mem, topic_mem, retrieved_notes, thinking_md)
+    ltid_s, lctx = load_last_subagent_context(root_path, user_id) if user_id else ("", "")
+    subagent_cont = ""
+    if user_id and task_id in (TaskId.CAD_CODER, TaskId.REASONING, TaskId.DEEP_RESEARCH):
+        subagent_cont = _format_subagent_continuity_for_prompt(ltid_s, lctx, task_id)
+    system_prompt = build_system_prompt(
+        root_path,
+        global_mem,
+        user_mem,
+        learner_block,
+        subagent_cont,
+        topic_mem,
+        retrieved_notes,
+        thinking_md,
+    )
     if task_id == TaskId.CAD_CODER:
         system_prompt = (
             system_prompt
@@ -653,16 +1519,19 @@ def chat_submit(
         r = RUNTIME.get("reasoning_llm")
         tok, mdl, lock = r["tokenizer"], r["model"], GEN_LOCKS["reasoning_llm"]
     elif task_id == TaskId.IMAGE_TINY:
-        yield working_display, conversation_state, display_state, "Image generation not yet implemented in v1.2", HIDDEN_PROGRESS
+        yield working_display, conversation_state, display_state, "Image generation not yet implemented in v1.2", HIDDEN_PROGRESS, acc_line
         return
     else:
         tok, mdl, lock = RUNTIME.main_tokenizer, RUNTIME.main_model, GEN_LOCKS["main"]
 
     if use_cloaker:
-        task_label_running = next((s.label for s in specs if s.id == task_id), task_label)
+        task_label_running = next((s.label for s in specs if s.id == task_id), "Module")
         step_lines.append(f"Running {task_label_running}…")
-        working_display[-1] = {"role": "assistant", "content": build_thinking_html_open(step_lines=step_lines)}
-        yield working_display, conversation_state, display_state, "Running model…", HIDDEN_PROGRESS
+        working_display[-1] = {
+            "role": "assistant",
+            "content": build_thinking_html_open(step_lines=step_lines, summary_label=summary_label),
+        }
+        yield working_display, conversation_state, display_state, "Running model…", HIDDEN_PROGRESS, acc_line
 
         module_output = generate_full(
             tokenizer=tok,
@@ -673,8 +1542,11 @@ def chat_submit(
             extra_generate_kwargs=coder_gen_extras,
         )
         step_lines.append("Drafting your reply…")
-        working_display[-1] = {"role": "assistant", "content": build_thinking_html_open(step_lines=step_lines)}
-        yield working_display, conversation_state, display_state, "Drafting…", HIDDEN_PROGRESS
+        working_display[-1] = {
+            "role": "assistant",
+            "content": build_thinking_html_open(step_lines=step_lines, summary_label=summary_label),
+        }
+        yield working_display, conversation_state, display_state, "Drafting…", HIDDEN_PROGRESS, acc_line
 
         step_lines.append("Synthesizing your answer…")
         thinking_collapsed = build_thinking_html_collapsed(summary=collapsed_summary, step_lines=list(step_lines))
@@ -686,7 +1558,7 @@ def chat_submit(
         "role": "assistant",
         "content": compose_assistant_display(base_thinking, render_live_text("")),
     }
-    yield working_display, conversation_state, display_state, "Writing response…", HIDDEN_PROGRESS
+    yield working_display, conversation_state, display_state, "Writing response…", HIDDEN_PROGRESS, acc_line
 
     try:
         if use_cloaker:
@@ -706,7 +1578,7 @@ def chat_submit(
                     "role": "assistant",
                     "content": compose_assistant_display(base_thinking, render_live_text(partial)),
                 }
-                yield working_display, conversation_state, display_state, "Writing response…", HIDDEN_PROGRESS
+                yield working_display, conversation_state, display_state, "Writing response…", HIDDEN_PROGRESS, acc_line
         else:
             final_text = ""
             for partial in generate_stream_chat(
@@ -722,7 +1594,7 @@ def chat_submit(
                     "role": "assistant",
                     "content": compose_assistant_display(base_thinking, render_live_text(partial)),
                 }
-                yield working_display, conversation_state, display_state, "Writing response…", HIDDEN_PROGRESS
+                yield working_display, conversation_state, display_state, "Writing response…", HIDDEN_PROGRESS, acc_line
 
         final_text = clean_model_text(final_text)
         working_display[-1] = {
@@ -736,6 +1608,13 @@ def chat_submit(
         ]
 
         save_topic_memory(root_path, user_id, user_msg, final_text)
+        if user_id and task_id in (TaskId.CAD_CODER, TaskId.REASONING, TaskId.DEEP_RESEARCH):
+            save_last_subagent_context(
+                root_path,
+                user_id,
+                task_id.value,
+                _snapshot_for_last_subagent(user_msg, final_text),
+            )
 
         if task_id == TaskId.CHAT_MAIN:
             try:
@@ -755,19 +1634,201 @@ def chat_submit(
             except Exception as log_exc:
                 print(f"[imagination] training log failed (turn still saved in chat): {log_exc}", flush=True)
 
-        task_label_short = next((s.label for s in specs if s.id == task_id), task_label)
-        yield new_disp, new_conv, new_disp, f"{task_label_short} ready", HIDDEN_PROGRESS
+        task_label_short = next((s.label for s in specs if s.id == task_id), "Imagination 1.2")
+        save_user_chat_state(root_path, user_id, new_conv, new_disp)
+        yield new_disp, new_conv, new_disp, f"{task_label_short} ready", HIDDEN_PROGRESS, acc_line
 
     except Exception as e:
         err_text = f"Error: {e}"
         working_display[-1] = {"role": "assistant", "content": err_text}
         new_conv = conversation_state + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": err_text}]
         new_disp = display_state + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": err_text}]
-        yield new_disp, new_conv, new_disp, f"Error: {e}", HIDDEN_PROGRESS
+        yield new_disp, new_conv, new_disp, f"Error: {e}", HIDDEN_PROGRESS, acc_line
 
 
-def clear_all():
-    return [], [], [], "Ready", "<div class='progress-bar hidden'></div>"
+def clear_all(user_session: Optional[Dict[str, Any]] = None):
+    root = resolve_root_path(None)
+    uid, dispn = resolve_effective_user(root, user_session)
+    if uid:
+        save_user_chat_state(root, uid, [], [])
+    acct = account_markdown(uid, dispn)
+    return (
+        [],
+        [],
+        [],
+        "Ready",
+        "<div class='progress-bar hidden'></div>",
+        acct,
+        gr.update(visible=False),
+        gr.update(interactive=True),
+        gr.update(interactive=True),
+        gr.update(interactive=True),
+        gr.update(value=CHAT_MODE_DEFAULT, interactive=True),
+        gr.update(value=""),
+        gr.update(value=""),
+        gr.update(visible=False),
+    )
+
+
+def dismiss_load_modal() -> Tuple[Any, ...]:
+    return (
+        gr.update(visible=False),
+        gr.update(interactive=True),
+        gr.update(interactive=True),
+        gr.update(interactive=True),
+        gr.update(interactive=True),
+        gr.update(value=""),
+        gr.update(value=""),
+        gr.update(visible=False),
+    )
+
+
+def hydrate_ui_from_session_json(payload: str):
+    """
+    Apply session + chat + notes + learner profile from GET /auth/me JSON (fetched in the browser on load).
+    Gradio's server-side load handler often does not receive Cookie headers; fetch fixes that.
+    """
+    import json
+
+    empty_profile = ("", "", "")
+
+    def _guest_banner(banner: str):
+        return (
+            {"id": None, "name": "", "email": ""},
+            [],
+            [],
+            [],
+            banner,
+            "",
+            *empty_profile,
+        )
+
+    guest = _guest_banner(account_markdown(0, "Guest"))
+    if not payload or not str(payload).strip():
+        return guest
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return guest
+    if not isinstance(data, dict):
+        return guest
+    extra = data.get("banner_extra") or ""
+    if not data.get("logged_in"):
+        return _guest_banner(account_markdown(0, "Guest") + extra)
+    try:
+        uid = int(data["id"])
+    except (KeyError, TypeError, ValueError):
+        return guest
+    name = (data.get("name") or "User").strip() or "User"
+    sess = {
+        "id": uid,
+        "name": name,
+        "email": (data.get("email") or "").strip(),
+    }
+    conv = data.get("conv") if isinstance(data.get("conv"), list) else []
+    disp = data.get("disp") if isinstance(data.get("disp"), list) else []
+    notes = data.get("notes") if isinstance(data.get("notes"), str) else ""
+    pa = data.get("profile_about") if isinstance(data.get("profile_about"), str) else ""
+    pg = data.get("profile_goals") if isinstance(data.get("profile_goals"), str) else ""
+    ps = data.get("profile_skills") if isinstance(data.get("profile_skills"), str) else ""
+    banner = account_markdown(uid, name) + extra
+    return sess, disp, conv, disp, banner, notes, pa, pg, ps
+
+
+def standalone_email_login(email: str, password: str):
+    root = resolve_root_path(None)
+    u = login_email_password(root, email or "", password or "")
+    if not u:
+        return (
+            {"id": None, "name": "", "email": ""},
+            [],
+            [],
+            [],
+            account_markdown(0, "Guest"),
+            "Invalid email or password.",
+            "",
+            "",
+            "",
+            "",
+        )
+    sess = session_dict_from_user(u)
+    conv, disp = load_user_chat_state(root, u.id)
+    notes = load_user_memory(root, u.id)
+    pa, pg, ps = load_learner_profile(root, u.id)
+    return (
+        sess,
+        disp,
+        conv,
+        disp,
+        account_markdown(u.id, sess["name"]),
+        "",
+        notes,
+        pa,
+        pg,
+        ps,
+    )
+
+
+def standalone_email_signup(email: str, password: str, display_name: str):
+    root = resolve_root_path(None)
+    user, err = signup_email_password(root, email or "", password or "", display_name or "")
+    if err or not user:
+        return (
+            {"id": None, "name": "", "email": ""},
+            [],
+            [],
+            [],
+            account_markdown(0, "Guest"),
+            err or "Could not sign up.",
+            "",
+            "",
+            "",
+            "",
+        )
+    sess = session_dict_from_user(user)
+    return (
+        sess,
+        [],
+        [],
+        [],
+        account_markdown(user.id, sess["name"]),
+        "Account created — start chatting.",
+        "",
+        "",
+        "",
+        "",
+    )
+
+
+def standalone_logout():
+    return (
+        {"id": None, "name": "", "email": ""},
+        [],
+        [],
+        [],
+        account_markdown(0, "Guest"),
+        "Signed out on this device. Sign in again to reload your saved chat from the server.",
+        "",
+        "",
+        "",
+        "",
+    )
+
+
+def save_user_notes_ui(
+    notes: str,
+    profile_about: str,
+    profile_goals: str,
+    profile_skills: str,
+    user_session: Optional[Dict[str, Any]],
+):
+    root = resolve_root_path(None)
+    uid, _ = resolve_effective_user(root, user_session)
+    if not uid:
+        return "Sign in to save notes and learner profile."
+    save_user_memory(root, uid, notes or "")
+    save_learner_profile(root, uid, profile_about, profile_goals, profile_skills)
+    return "Saved notes and learner profile (used in future replies for your account)."
 
 
 # ----------------------------
@@ -819,54 +1880,86 @@ CSS = """
   margin: 0 0 4px 0;
   color: var(--text);
 }
-.app-brand p {
-  margin: 0;
-  font-size: 0.8125rem;
+.app-brand .ver {
+  font-size: 0.72em;
+  font-weight: 500;
   color: var(--muted);
-  font-weight: 400;
+  margin-left: 0.35em;
+  vertical-align: middle;
+  letter-spacing: 0.04em;
 }
 
-.model-panel {
+.load-modal-backdrop {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 99990 !important;
+  display: flex !important;
+  flex-direction: column !important;
+  justify-content: center !important;
+  align-items: center !important;
+  background: rgba(5,7,12,0.48) !important;
+  backdrop-filter: blur(8px) !important;
+  -webkit-backdrop-filter: blur(8px) !important;
+  padding: 24px !important;
+}
+.load-modal-backdrop > .form,
+.load-modal-backdrop > div:not(.load-modal-card) {
+  width: auto !important;
+  max-width: min(50vw, 560px) !important;
+  max-height: 50vh !important;
+  margin: 0 auto !important;
+  flex-shrink: 0 !important;
+}
+.load-modal-card {
+  background: linear-gradient(165deg, rgba(22,26,38,0.98), rgba(10,12,18,0.99)) !important;
+  border: 1px solid rgba(124,142,240,0.28) !important;
+  border-radius: var(--radius-lg) !important;
+  padding: 22px 20px 20px !important;
+  box-shadow: 0 32px 80px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.04) inset !important;
+  width: min(50vw, 560px) !important;
+  max-width: min(92vw, 560px) !important;
+  max-height: min(50vh, 480px) !important;
+  overflow-x: hidden !important;
+  overflow-y: auto !important;
+}
+.modal-pbar {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+  margin: 10px 0 14px;
+}
+.modal-pfill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), #9aa8ff);
+  transition: width 0.2s ease-out;
+  box-shadow: 0 0 12px var(--accent-glow);
+}
+.load-modal-card h3 {
+  margin: 0 0 10px 0 !important;
+  font-size: 1.05rem !important;
+  font-weight: 600 !important;
+  color: var(--text) !important;
+}
+.load-modal-card .prose, .load-modal-card p, .load-modal-card li {
+  color: var(--muted) !important;
+  font-size: 0.875rem !important;
+  line-height: 1.5 !important;
+}
+#modal-dismiss-btn {
+  margin-top: 16px !important;
+  width: 100% !important;
+}
+
+.status-strip {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  padding: 14px 16px 18px;
+  padding: 12px 16px 14px;
   margin-bottom: 14px;
   box-shadow: var(--shadow);
   backdrop-filter: blur(20px);
-}
-.model-panel-label {
-  font-size: 0.6875rem;
-  font-weight: 600;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--muted);
-  margin-bottom: 10px;
-}
-
-#task-radio, #task-radio fieldset, #task-radio .wrap {
-  gap: 8px !important;
-  flex-wrap: wrap !important;
-}
-#task-radio label {
-  font-size: 0.8125rem !important;
-  font-weight: 500 !important;
-  padding: 8px 14px !important;
-  border-radius: 999px !important;
-  border: 1px solid var(--border) !important;
-  background: var(--bg0) !important;
-  color: var(--muted) !important;
-  transition: border-color 0.15s, background 0.15s, color 0.15s !important;
-}
-#task-radio label:hover {
-  border-color: var(--border-strong) !important;
-  color: var(--text) !important;
-}
-#task-radio input:checked + span,
-#task-radio label:has(input:checked) {
-  border-color: rgba(124,142,240,0.45) !important;
-  background: var(--accent-dim) !important;
-  color: var(--accent) !important;
 }
 
 #status-wrap {
@@ -974,6 +2067,66 @@ CSS = """
 #chatbox details.thinking-block .thinking-step:last-child {
   margin-bottom: 0;
 }
+#chatbox details.thinking-block .thinking-em {
+  color: #ffffff;
+  font-weight: 700;
+  font-size: inherit;
+}
+/* Subagent weight load: percentage + name pulse with indigo accent (matches --accent) */
+#chatbox details.thinking-block .thinking-step--loading {
+  border-left: 2px solid rgba(124, 142, 240, 0.42);
+  padding-left: 10px;
+  margin-left: 2px;
+  border-radius: 0 8px 8px 0;
+  background: linear-gradient(
+    105deg,
+    rgba(124, 142, 240, 0.1) 0%,
+    rgba(124, 142, 240, 0.03) 42%,
+    transparent 72%
+  );
+  background-size: 220% 100%;
+  animation: thinking-load-border 1.85s ease-in-out infinite,
+    thinking-load-sheen 2.6s ease-in-out infinite;
+}
+@keyframes thinking-load-border {
+  0%, 100% {
+    border-left-color: rgba(124, 142, 240, 0.32);
+    box-shadow: inset 3px 0 14px rgba(124, 142, 240, 0.07);
+  }
+  50% {
+    border-left-color: rgba(168, 180, 255, 0.85);
+    box-shadow: inset 3px 0 20px rgba(124, 142, 240, 0.16);
+  }
+}
+@keyframes thinking-load-sheen {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+#chatbox details.thinking-block .thinking-step--loading .thinking-em {
+  animation: thinking-em-shine 1.45s ease-in-out infinite;
+}
+@keyframes thinking-em-shine {
+  0%, 100% {
+    color: #f2f4ff;
+    text-shadow: 0 0 0 transparent;
+  }
+  50% {
+    color: #ffffff;
+    text-shadow:
+      0 0 10px rgba(124, 142, 240, 0.5),
+      0 0 22px rgba(124, 142, 240, 0.22);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  #chatbox details.thinking-block .thinking-step--loading,
+  #chatbox details.thinking-block .thinking-step--loading .thinking-em {
+    animation: none;
+  }
+  #chatbox details.thinking-block .thinking-step--loading {
+    background: rgba(124, 142, 240, 0.06);
+    background-size: auto;
+  }
+}
 #chatbox .thinking-dots {
   display: inline-flex;
   gap: 3px;
@@ -1006,11 +2159,45 @@ CSS = """
   border-radius: var(--radius-md) !important;
 }
 
-.input-row {
-  display: flex;
-  gap: 10px;
-  align-items: flex-end;
+.composer-row {
+  display: flex !important;
+  flex-wrap: wrap !important;
+  gap: 10px !important;
+  align-items: flex-end !important;
 }
+#chat-mode-dropdown {
+  min-width: 168px !important;
+  flex: 0 0 auto !important;
+}
+#chat-mode-dropdown label {
+  display: none !important;
+}
+#chat-mode-dropdown .wrap,
+#chat-mode-dropdown .secondary-wrap {
+  border-radius: var(--radius-lg) !important;
+  border: 1px solid var(--border-strong) !important;
+  background: linear-gradient(180deg, rgba(255,255,255,0.07) 0%, var(--bg0) 100%) !important;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.05) !important;
+  min-height: 48px !important;
+}
+#chat-mode-dropdown .wrap:focus-within,
+#chat-mode-dropdown .secondary-wrap:focus-within {
+  border-color: rgba(124,142,240,0.45) !important;
+  box-shadow: 0 0 0 3px var(--accent-dim) !important;
+}
+#chat-mode-dropdown input,
+#chat-mode-dropdown button[role="combobox"] {
+  border-radius: var(--radius-lg) !important;
+  font-size: 0.8125rem !important;
+  font-weight: 600 !important;
+  color: var(--text) !important;
+  background: transparent !important;
+}
+#chat-mode-dropdown span[data-testid] {
+  font-weight: 600 !important;
+}
+
+.composer-row textarea,
 .input-row textarea {
   font-family: 'DM Sans', system-ui, sans-serif !important;
   font-size: 0.9375rem !important;
@@ -1020,26 +2207,29 @@ CSS = """
   background: var(--bg0) !important;
   color: var(--text) !important;
   border: 1px solid var(--border) !important;
-  border-radius: var(--radius-md) !important;
+  border-radius: var(--radius-lg) !important;
   padding: 12px 14px !important;
 }
+.composer-row textarea:focus,
 .input-row textarea:focus {
   border-color: rgba(124,142,240,0.45) !important;
   box-shadow: 0 0 0 3px var(--accent-dim) !important;
 }
+.composer-row button.primary,
 .input-row button.primary {
   font-weight: 600 !important;
   font-size: 0.875rem !important;
   padding: 12px 22px !important;
-  border-radius: var(--radius-md) !important;
+  border-radius: var(--radius-lg) !important;
   background: linear-gradient(180deg, rgba(124,142,240,0.35), rgba(124,142,240,0.18)) !important;
   border: 1px solid rgba(124,142,240,0.4) !important;
   color: var(--text) !important;
 }
+.composer-row button.secondary,
 .input-row button.secondary {
   font-size: 0.8125rem !important;
   padding: 12px 16px !important;
-  border-radius: var(--radius-md) !important;
+  border-radius: var(--radius-lg) !important;
   background: transparent !important;
   border: 1px solid var(--border) !important;
   color: var(--muted) !important;
@@ -1047,10 +2237,7 @@ CSS = """
 """
 
 
-def build_ui():
-    task_specs = get_task_specs()
-    task_labels = [s.label for s in task_specs]
-
+def build_ui(auth_http_available: bool = False):
     theme = gr.themes.Soft(
         primary_hue="indigo",
         secondary_hue="slate",
@@ -1064,25 +2251,30 @@ def build_ui():
         block_label_text_size="sm",
     )
 
+    _google_on = bool(os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET"))
+    _hf_oauth = bool(os.getenv("SPACE_ID") or os.getenv("HF_TOKEN"))
+    if not _hf_oauth:
+        try:
+            from huggingface_hub import get_token
+
+            _hf_oauth = get_token() is not None
+        except Exception:
+            _hf_oauth = False
+
     with gr.Blocks(css=CSS, theme=theme, title="Imagination v1.2") as demo:
         with gr.Column(elem_id="shell"):
             gr.HTML("""
             <header class="app-brand">
-              <h1>Imagination</h1>
-              <p>v1.2 · Select a model, then ask anything.</p>
+              <h1>Imagination <span class="ver">v1.2</span></h1>
             </header>
             """)
 
-            with gr.Column(elem_classes=["model-panel"]):
-                gr.HTML('<div class="model-panel-label">Model</div>')
-                task = gr.Radio(
-                    choices=task_labels,
-                    value=task_labels[0],
-                    label=None,
-                    show_label=False,
-                    elem_id="task-radio",
-                    container=False,
-                )
+            user_session = gr.State({"id": None, "name": "", "email": ""})
+            _session_json_bridge = gr.Textbox(value="", visible=False, elem_id="imagination-session-json-bridge")
+            auth_banner = gr.Markdown(account_markdown(0, "Guest"))
+            login_hint = gr.Markdown("")
+
+            with gr.Column(elem_classes=["status-strip"]):
                 progress_html = gr.HTML("<div class='progress-bar hidden'></div>")
                 with gr.Row(elem_id="status-wrap"):
                     status = gr.Markdown("Ready", elem_id="status")
@@ -1111,28 +2303,199 @@ def build_ui():
                         render_markdown=True,
                     )
 
-            with gr.Row(elem_classes=["input-row"]):
+            with gr.Row(elem_classes=["composer-row"]):
+                chat_mode = gr.Dropdown(
+                    choices=CHAT_MODE_CHOICES,
+                    value=CHAT_MODE_DEFAULT,
+                    label=None,
+                    show_label=False,
+                    elem_id="chat-mode-dropdown",
+                    container=False,
+                    scale=2,
+                    min_width=176,
+                )
                 user = gr.Textbox(
                     placeholder="Message…",
                     show_label=False,
                     container=False,
-                    scale=9,
+                    scale=6,
                     lines=1,
                     max_lines=4,
+                    elem_classes=["composer-input"],
                 )
                 send = gr.Button("Send", variant="primary", elem_classes=["primary"], scale=1)
                 clear_btn = gr.Button("Clear", elem_classes=["secondary"], scale=0)
 
+            with gr.Column(
+                elem_id="load-modal-root",
+                elem_classes=["load-modal-backdrop"],
+                visible=False,
+            ) as load_modal:
+                with gr.Column(elem_classes=["load-modal-card"]):
+                    modal_title = gr.Markdown("")
+                    modal_body = gr.Markdown("")
+                    modal_dismiss = gr.Button("Dismiss", elem_id="modal-dismiss-btn", variant="secondary", visible=False)
+
             conversation_state = gr.State([])
             display_state = gr.State([])
 
+            le = lp = ld = None
+            b_in = b_up = b_out = None
+
+            with gr.Accordion("Account · privacy & saved memory", open=False):
+                if auth_http_available:
+                    _lines = [
+                        "**Sign-in:** use the forms below (secure cookie after `python app.py`). "
+                        "Fill **learner profile** fields so replies match your level and interests.",
+                    ]
+                    if _google_on:
+                        _lines.append("[Continue with Google](/auth/google/login)")
+                    _lines.append("[Log out](/auth/logout)")
+                    gr.Markdown(" ".join(_lines))
+                    gr.HTML(
+                        """
+<form method="post" action="/auth/email/login" style="display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;margin:10px 0;">
+  <input name="email" type="email" placeholder="Email" required style="flex:1;min-width:180px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);background:#0a0c12;color:#eef0ff"/>
+  <input name="password" type="password" placeholder="Password" required style="flex:1;min-width:140px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);background:#0a0c12;color:#eef0ff"/>
+  <button type="submit" style="padding:10px 18px;border-radius:12px;background:rgba(124,142,240,0.4);border:1px solid rgba(124,142,240,0.5);color:#fff;font-weight:600;cursor:pointer">Sign in</button>
+</form>
+<form method="post" action="/auth/email/signup" style="display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;margin:10px 0;">
+  <input name="display_name" type="text" placeholder="Display name (optional)" style="flex:1;min-width:140px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);background:#0a0c12;color:#eef0ff"/>
+  <input name="email" type="email" placeholder="Email" required style="flex:1;min-width:180px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);background:#0a0c12;color:#eef0ff"/>
+  <input name="password" type="password" placeholder="Password (6+ chars)" required style="flex:1;min-width:140px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);background:#0a0c12;color:#eef0ff"/>
+  <button type="submit" style="padding:10px 18px;border-radius:12px;background:transparent;border:1px solid rgba(255,255,255,0.2);color:#e8ecff;font-weight:600;cursor:pointer">Create account</button>
+</form>
+                        """
+                    )
+                else:
+                    gr.Markdown(
+                        "*Without the FastAPI app (`python app.py`), use the buttons here — "
+                        "refreshing the page clears the session. Chats are still isolated per browser tab until then.*"
+                    )
+                    le = gr.Textbox(label="Email", lines=1)
+                    lp = gr.Textbox(label="Password", type="password", lines=1)
+                    ld = gr.Textbox(label="Display name (signup only)", lines=1)
+                    with gr.Row():
+                        b_in = gr.Button("Sign in")
+                        b_up = gr.Button("Create account")
+                        b_out = gr.Button("Sign out")
+
+                user_notes = gr.Textbox(
+                    label="Long-term notes (free-form — only for your account)",
+                    lines=4,
+                    placeholder="e.g. Prefer short answers; call me by first name; I'm working on a science fair project…",
+                )
+                profile_about = gr.Textbox(
+                    label="About you (background, age band, what you do)",
+                    lines=3,
+                    placeholder="e.g. 9th grade student; builds robots after school; prefers hands-on examples",
+                )
+                profile_goals = gr.Textbox(
+                    label="Interests & goals (likes, dislikes, what you're trying to learn)",
+                    lines=3,
+                    placeholder="e.g. Loves astronomy; nervous about public speaking; wants to understand how LLMs work",
+                )
+                profile_skills = gr.Textbox(
+                    label="Skills & familiarity (topic → level, one per line)",
+                    lines=4,
+                    placeholder="algebra: strong\nPython: beginner\nmusic theory: intermediate\n…",
+                )
+                notes_status = gr.Markdown("")
+                save_notes_btn = gr.Button("Save notes & learner profile")
+
+            if not auth_http_available and b_in is not None and b_up is not None and b_out is not None:
+                b_in.click(
+                    standalone_email_login,
+                    inputs=[le, lp],
+                    outputs=[
+                        user_session,
+                        chat,
+                        conversation_state,
+                        display_state,
+                        auth_banner,
+                        login_hint,
+                        user_notes,
+                        profile_about,
+                        profile_goals,
+                        profile_skills,
+                    ],
+                )
+                b_up.click(
+                    standalone_email_signup,
+                    inputs=[le, lp, ld],
+                    outputs=[
+                        user_session,
+                        chat,
+                        conversation_state,
+                        display_state,
+                        auth_banner,
+                        login_hint,
+                        user_notes,
+                        profile_about,
+                        profile_goals,
+                        profile_skills,
+                    ],
+                )
+                b_out.click(
+                    standalone_logout,
+                    outputs=[
+                        user_session,
+                        chat,
+                        conversation_state,
+                        display_state,
+                        auth_banner,
+                        login_hint,
+                        user_notes,
+                        profile_about,
+                        profile_goals,
+                        profile_skills,
+                    ],
+                )
+
+            if _hf_oauth:
+                gr.LoginButton("Sign in with Hugging Face")
+
             def chat_inputs():
-                return [task, user, conversation_state, display_state]
+                return [chat_mode, user, conversation_state, display_state, user_session]
+
+            save_notes_btn.click(
+                save_user_notes_ui,
+                inputs=[user_notes, profile_about, profile_goals, profile_skills, user_session],
+                outputs=[notes_status],
+            )
+
+            modal_targets = [
+                load_modal,
+                user,
+                send,
+                clear_btn,
+                chat_mode,
+                modal_title,
+                modal_body,
+                modal_dismiss,
+            ]
+
+            chat_mode.change(
+                fn=iter_preload_on_mode_change,
+                inputs=[chat_mode],
+                outputs=modal_targets,
+            )
+
+            modal_dismiss.click(fn=dismiss_load_modal, inputs=None, outputs=modal_targets)
+
+            _chat_out = [
+                chat,
+                conversation_state,
+                display_state,
+                status,
+                progress_html,
+                auth_banner,
+            ]
 
             send_evt = send.click(
                 fn=chat_submit,
                 inputs=chat_inputs(),
-                outputs=[chat, conversation_state, display_state, status, progress_html],
+                outputs=_chat_out,
                 concurrency_limit=1,
                 concurrency_id="chat_gpu",
             )
@@ -1141,17 +2504,83 @@ def build_ui():
             user.submit(
                 fn=chat_submit,
                 inputs=chat_inputs(),
-                outputs=[chat, conversation_state, display_state, status, progress_html],
+                outputs=_chat_out,
                 concurrency_limit=1,
                 concurrency_id="chat_gpu",
             ).then(lambda: "", None, user)
 
-            clear_btn.click(fn=clear_all, inputs=None, outputs=[chat, conversation_state, display_state, status, progress_html])
+            clear_btn.click(
+                fn=clear_all,
+                inputs=[user_session],
+                outputs=[
+                    chat,
+                    conversation_state,
+                    display_state,
+                    status,
+                    progress_html,
+                    auth_banner,
+                    *modal_targets,
+                ],
+            )
 
-    demo.queue(default_concurrency_limit=1)
+        demo.queue(default_concurrency_limit=1)
+        demo.load(
+            fn=hydrate_ui_from_session_json,
+            inputs=[_session_json_bridge],
+            outputs=[
+                user_session,
+                chat,
+                conversation_state,
+                display_state,
+                auth_banner,
+                user_notes,
+                profile_about,
+                profile_goals,
+                profile_skills,
+            ],
+            js="""
+            async () => {
+                const q = window.location.search || '';
+                try {
+                    const r = await fetch('/auth/me' + q, { credentials: 'same-origin' });
+                    const j = await r.json();
+                    return JSON.stringify(j);
+                } catch (e) {
+                    return JSON.stringify({ logged_in: false, banner_extra: '' });
+                }
+            }
+            """,
+        )
+        demo.load(
+            js="""
+            () => {
+                const tip = "Extra models and external modules";
+                const mark = () => {
+                    const root = document.getElementById("chat-mode-dropdown");
+                    if (!root) return;
+                    const t = root.querySelector("button, [role='combobox'], select");
+                    if (t && !t.dataset.imTip) {
+                        t.title = tip;
+                        t.dataset.imTip = "1";
+                    }
+                };
+                mark();
+                const obs = new MutationObserver(mark);
+                obs.observe(document.body, { childList: true, subtree: true });
+            }
+            """,
+        )
     return demo
 
 
 if __name__ == "__main__":
-    demo = build_ui()
-    demo.launch(share=True, server_port=7860)
+    try:
+        from imagination_runtime.asgi_app import build_full_app
+        import uvicorn
+
+        demo = build_ui(auth_http_available=True)
+        app = build_full_app(demo)
+        uvicorn.run(app, host="0.0.0.0", port=7860)
+    except ImportError:
+        demo = build_ui(auth_http_available=False)
+        demo.launch(share=True, server_port=7860)
