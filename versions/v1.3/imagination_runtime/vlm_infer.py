@@ -25,7 +25,19 @@ BNB_4BIT = BitsAndBytesConfig(
 )
 
 
+def _main_load_bf16() -> bool:
+    """Full-weight bf16 on GPU (e.g. Colab L4) — disables 4-bit load for the main LM."""
+    return (os.getenv("IMAGINATION_MAIN_LOAD_BF16") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _use_4bit() -> bool:
+    if _main_load_bf16():
+        return False
     return torch.cuda.is_available()
 
 
@@ -78,9 +90,14 @@ def load_main_model_auto(path: str) -> tuple[Any, Any, Any, bool]:
 
     if text_only or not checkpoint_looks_like_vlm(path):
         tok = AutoTokenizer.from_pretrained(path, use_fast=True, trust_remote_code=True)
-        kwargs: Dict[str, Any] = {"device_map": "auto", "torch_dtype": "auto", "trust_remote_code": True}
+        kwargs: Dict[str, Any] = {"device_map": "auto", "trust_remote_code": True}
         if _use_4bit():
+            kwargs["torch_dtype"] = "auto"
             kwargs["quantization_config"] = BNB_4BIT
+        elif _main_load_bf16() and torch.cuda.is_available():
+            kwargs["torch_dtype"] = torch.bfloat16
+        else:
+            kwargs["torch_dtype"] = "auto"
         model = AutoModelForCausalLM.from_pretrained(path, **kwargs)
         if getattr(tok, "pad_token_id", None) is None:
             tok.pad_token = tok.eos_token
@@ -94,9 +111,14 @@ def load_main_model_auto(path: str) -> tuple[Any, Any, Any, bool]:
     if getattr(tok, "pad_token_id", None) is None:
         tok.pad_token = tok.eos_token
 
-    kwargs = {"device_map": "auto", "torch_dtype": "auto", "trust_remote_code": True}
+    kwargs = {"device_map": "auto", "trust_remote_code": True}
     if _use_4bit():
+        kwargs["torch_dtype"] = "auto"
         kwargs["quantization_config"] = BNB_4BIT
+    elif _main_load_bf16() and torch.cuda.is_available():
+        kwargs["torch_dtype"] = torch.bfloat16
+    else:
+        kwargs["torch_dtype"] = "auto"
 
     model = None
     mt = _read_config_model_type(path)

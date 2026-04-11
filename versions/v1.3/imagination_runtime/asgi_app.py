@@ -5,6 +5,9 @@ Optional Next.js static UI (single process with the model): build the frontend w
 IMAGINATION_NEXT_EXPORT=1 and IMAGINATION_NEXT_BASE_PATH=/next, then run python app.py.
 The export is served at /next/ alongside Gradio at /. Set IMAGINATION_NEXT_UI=0 to skip.
 
+``build_backend_only_app()`` exposes the same auth + ``/api/*`` + optional ``/next`` static
+mount **without** Gradio — for ``python api_server.py`` (Tailscale + chat routes).
+
 Do not use `from __future__ import annotations` in this module: route handlers are
 defined inside build_full_app(), and postponed annotations can prevent FastAPI from
 recognizing Starlette Request. It then treats a parameter named "request" as a required
@@ -42,13 +45,10 @@ def _session_cookie_kwargs(request: Any) -> dict:
     }
 
 
-def build_full_app(demo: Any) -> Any:
-    import gradio as gr
-    from fastapi import FastAPI, Form
+def _register_auth_and_meta_routes(app: Any, *, home_url: str, backend_only: bool) -> None:
+    from fastapi import Form
     from fastapi.responses import JSONResponse, RedirectResponse
     from urllib.parse import parse_qs
-
-    app = FastAPI()
 
     @app.get("/auth/me")
     async def auth_me(http_request: Request):
@@ -122,8 +122,8 @@ def build_full_app(demo: Any) -> Any:
         root = resolve_root_path(None)
         u = login_email_password(root, email, password)
         if not u:
-            return RedirectResponse(url="/?login=failed", status_code=302)
-        resp = RedirectResponse(url="/", status_code=302)
+            return RedirectResponse(url=f"{home_url}?login=failed", status_code=302)
+        resp = RedirectResponse(url=home_url, status_code=302)
         ck = _session_cookie_kwargs(http_request)
         resp.set_cookie("imagination_uid", sign_user_id(u.id), **ck)
         return resp
@@ -142,15 +142,15 @@ def build_full_app(demo: Any) -> Any:
         root = resolve_root_path(None)
         user, err = signup_email_password(root, email, password, display_name or "")
         if err or not user:
-            return RedirectResponse(url=f"/?signup_error={quote(err or 'signup failed')}", status_code=302)
-        resp = RedirectResponse(url="/", status_code=302)
+            return RedirectResponse(url=f"{home_url}?signup_error={quote(err or 'signup failed')}", status_code=302)
+        resp = RedirectResponse(url=home_url, status_code=302)
         ck = _session_cookie_kwargs(http_request)
         resp.set_cookie("imagination_uid", sign_user_id(user.id), **ck)
         return resp
 
     @app.get("/auth/logout")
     async def logout(http_request: Request):
-        resp = RedirectResponse(url="/", status_code=302)
+        resp = RedirectResponse(url=home_url, status_code=302)
         ck = _session_cookie_kwargs(http_request)
         resp.delete_cookie("imagination_uid", path="/", secure=ck["secure"], httponly=True, samesite="lax")
         return resp
@@ -192,12 +192,12 @@ def build_full_app(demo: Any) -> Any:
                     except Exception:
                         userinfo = {}
                 if not userinfo:
-                    return RedirectResponse(url="/?login=failed", status_code=302)
+                    return RedirectResponse(url=f"{home_url}?login=failed", status_code=302)
                 sub = userinfo.get("sub")
                 email = userinfo.get("email") or ""
                 name = userinfo.get("name") or (email.split("@")[0] if email else "User")
                 if not sub:
-                    return RedirectResponse(url="/?login=failed", status_code=302)
+                    return RedirectResponse(url=f"{home_url}?login=failed", status_code=302)
                 root = resolve_root_path(None)
                 u = get_or_create_user(
                     root,
@@ -206,7 +206,7 @@ def build_full_app(demo: Any) -> Any:
                     display_name=name,
                     email=email,
                 )
-                resp = RedirectResponse(url="/", status_code=302)
+                resp = RedirectResponse(url=home_url, status_code=302)
                 ck = _session_cookie_kwargs(http_request)
                 resp.set_cookie("imagination_uid", sign_user_id(u.id), **ck)
                 return resp
@@ -219,15 +219,37 @@ def build_full_app(demo: Any) -> Any:
 
     @app.get("/api/info")
     async def api_info():
+        from imagination_runtime.ngrok_tunnel import tunnel_info_dict
+
         nxt = _next_static_root()
-        return JSONResponse(
-            {
-                "version": "v1.3",
-                "gradio_path": "/",
-                "next_static_path": "/next/" if nxt else None,
-                "next_static_dir": str(nxt) if nxt else None,
-            }
-        )
+        payload = {
+            "version": "v1.3",
+            "gradio_path": None if backend_only else "/",
+            "backend_only": backend_only,
+            "next_static_path": "/next/" if nxt else None,
+            "next_static_dir": str(nxt) if nxt else None,
+        }
+        payload.update(tunnel_info_dict())
+        return JSONResponse(payload)
+
+    if backend_only:
+
+        @app.get("/")
+        async def _root_index():
+            from imagination_runtime.ngrok_tunnel import tunnel_info_dict
+
+            d = tunnel_info_dict()
+            return JSONResponse(
+                {
+                    "service": "imagination-v1.3",
+                    "ui": "none",
+                    "auth": "/auth/me",
+                    "health": "/api/health",
+                    "chat": "/api/chat",
+                    "public_base_url": d.get("public_base_url"),
+                    "public_api_health": d.get("public_api_health"),
+                }
+            )
 
     next_root = _next_static_root()
     if next_root is not None:
@@ -243,4 +265,34 @@ def build_full_app(demo: Any) -> Any:
             flush=True,
         )
 
+
+def build_full_app(demo: Any) -> Any:
+    import gradio as gr
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    _register_auth_and_meta_routes(app, home_url="/", backend_only=False)
     return gr.mount_gradio_app(app, demo, path="/")
+
+
+def build_backend_only_app() -> Any:
+    """FastAPI with auth, ``/api/*``, optional ``/next`` static, chat routes — **no** Gradio."""
+    from fastapi import FastAPI
+
+    from imagination_runtime.chat_http import add_cors_from_env, attach_generation_routes
+
+    app = FastAPI(title="Imagination 1.3 API", version="1.3.0")
+    add_cors_from_env(app)
+    _register_auth_and_meta_routes(app, home_url="/auth/me", backend_only=True)
+    attach_generation_routes(app)
+
+    @app.on_event("startup")
+    def _startup_backend() -> None:
+        from colab_backend import _load_model_stack, _tailscale_connect
+
+        _tailscale_connect()
+        if (os.getenv("IMAGINATION_MAIN_ALREADY_LOADED") or "").strip() == "1":
+            return
+        _load_model_stack()
+
+    return app

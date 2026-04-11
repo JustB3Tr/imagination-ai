@@ -32,7 +32,18 @@ BNB_4BIT = BitsAndBytesConfig(
 )
 
 
+def _main_load_bf16() -> bool:
+    return (os.getenv("IMAGINATION_MAIN_LOAD_BF16") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _use_4bit() -> bool:
+    if _main_load_bf16():
+        return False
     return torch.cuda.is_available()
 
 
@@ -277,9 +288,14 @@ def load_clip_projector_bundle(llm_path: str, bundle_dir: str) -> tuple[Any, Any
         tokenizer.add_special_tokens({"additional_special_tokens": [image_token]})
         patched_image_vocab = True
 
-    llm_kwargs: Dict[str, Any] = {"device_map": "auto", "torch_dtype": "auto", "trust_remote_code": True}
+    llm_kwargs: Dict[str, Any] = {"device_map": "auto", "trust_remote_code": True}
     if _use_4bit():
+        llm_kwargs["torch_dtype"] = "auto"
         llm_kwargs["quantization_config"] = BNB_4BIT
+    elif _main_load_bf16() and torch.cuda.is_available():
+        llm_kwargs["torch_dtype"] = torch.bfloat16
+    else:
+        llm_kwargs["torch_dtype"] = "auto"
     llm = AutoModelForCausalLM.from_pretrained(llm_path, **llm_kwargs)
     llm.eval()
 

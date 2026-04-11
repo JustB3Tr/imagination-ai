@@ -5,9 +5,12 @@ Imagination v1.3 — Colab single-cell full stack (or run: python colab_fullstac
 Launches in order:
   1) AI backend: app.py (preload_main_model() runs before uvicorn binds — wait on /api/health)
   2) Flask bridge: server.py on 0.0.0.0
-  3) Next.js dev: npm run dev on 0.0.0.0
+  3) Next.js dev server on 0.0.0.0 (local node_modules/.bin/next)
 
-Paste into one Colab cell after Drive mount + deps, or run from a terminal.
+If node_modules is missing, on **Colab** the orchestrator runs `npm install` in the frontend
+folder automatically (disable with COLAB_STACK_AUTO_NPM_INSTALL=0).
+
+Paste into one Colab cell after Drive mount + Python deps + Node/npm, or run from a terminal.
 
 Model lifecycle (on-demand auxiliary modules) lives in imagination_runtime/model_lifecycle.py
 and is used by the Gradio/FastAPI app inside app.py — do not bypass it for real inference.
@@ -16,6 +19,7 @@ from __future__ import annotations
 
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -47,6 +51,47 @@ AI_WAIT_STATUS_INTERVAL_S = float(os.environ.get("AI_WAIT_STATUS_INTERVAL_S", "3
 LOG_DIR = Path(os.environ.get("COLAB_STACK_LOG_DIR", "/tmp/imagination_colab_stack_logs"))
 AI_LOG = LOG_DIR / "ai_backend.log"
 FLASK_LOG = LOG_DIR / "flask_bridge.log"
+
+
+def _in_colab() -> bool:
+    try:
+        import google.colab  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def _auto_npm_install_enabled() -> bool:
+    """
+    If unset: auto-run npm install when Next is missing — on in Colab, off elsewhere.
+    Override with COLAB_STACK_AUTO_NPM_INSTALL=1 or =0.
+    """
+    raw = (os.environ.get("COLAB_STACK_AUTO_NPM_INSTALL") or "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    return _in_colab()
+
+
+def _run_npm_install_frontend() -> bool:
+    """Return True if node_modules now contains the Next CLI."""
+    npm = shutil.which("npm") or (os.environ.get("NPM_PATH") or "").strip()
+    if not npm:
+        print(
+            "[orchestrator] No `npm` on PATH. Install Node.js in Colab, e.g.\n"
+            "  !apt-get update -qq && apt-get install -qq -y nodejs npm",
+            flush=True,
+        )
+        return False
+    fe = FRONTEND_DIR.resolve()
+    print(f"[orchestrator] Running `npm install` under:\n  {fe}\n  (can take several minutes; large folder on Drive may be slow)…\n", flush=True)
+    r = subprocess.run([npm, "install"], cwd=str(fe), env=os.environ.copy())
+    if r.returncode != 0:
+        print(f"[orchestrator] npm install failed (exit {r.returncode}).", flush=True)
+        return False
+    return _next_dev_command() is not None
 
 
 def _next_dev_command() -> Optional[List[str]]:
@@ -251,15 +296,25 @@ def main() -> int:
         return 1
 
     next_cmd = _next_dev_command()
+    if next_cmd is None and _auto_npm_install_enabled():
+        if _run_npm_install_frontend():
+            next_cmd = _next_dev_command()
+
     if next_cmd is None:
+        fe = FRONTEND_DIR.resolve()
         print(
-            "[orchestrator] ERROR: Next.js is not installed under front&back/frontend.\n"
-            "  `npm run dev` failed with `next: not found` when node_modules is missing.\n"
-            "  Fix — run in a cell **before** the orchestrator:",
+            "[orchestrator] ERROR: Next.js dependencies still missing (no local `next` CLI).\n"
+            "  Install manually, then re-run the orchestrator:",
             flush=True,
         )
-        print(f'    %cd "{FRONTEND_DIR}"', flush=True)
+        print(f'    %cd "{fe}"', flush=True)
         print("    !npm install", flush=True)
+        if not _auto_npm_install_enabled():
+            print(
+                "\n  Tip: on Colab, auto-install is on by default; if you disabled it, unset\n"
+                "  COLAB_STACK_AUTO_NPM_INSTALL or set it to 1.",
+                flush=True,
+            )
         _terminate_all(procs)
         ai_log_f.close()
         flask_log_f.close()

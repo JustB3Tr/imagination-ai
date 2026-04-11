@@ -34,7 +34,13 @@ const models: { id: ModelType; name: string; description: string; icon: React.Re
 
 export function ModelSelector() {
   const { currentModel, setCurrentModel } = useChatContext();
-  const selectedModel = models.find((m) => m.id === currentModel) || models[0];
+  const fallback = models[0];
+  const selectedModel =
+    models.find((m) => m.id === currentModel) ?? fallback;
+
+  if (!selectedModel) {
+    return null;
+  }
 
   return (
     <DropdownMenu>

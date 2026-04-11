@@ -89,7 +89,7 @@ export function ChatMessages() {
     }
   }, [chat?.messages]);
 
-  if (!chat || chat.messages.length === 0) {
+  if (!chat || (chat.messages?.length ?? 0) === 0) {
     return (
       <div className="flex-1 flex items-center justify-center">
         <div className="text-center max-w-md px-4">
@@ -110,7 +110,7 @@ export function ChatMessages() {
   return (
     <ScrollArea ref={scrollRef} className="flex-1 px-4">
       <div className="max-w-3xl mx-auto py-8 space-y-6">
-        {chat.messages.map((message) => (
+        {(chat.messages ?? []).map((message) => (
           <div
             key={message.id}
             className={cn(
@@ -152,7 +152,7 @@ export function ChatMessages() {
                 {/* Attachments */}
                 {message.attachments && message.attachments.length > 0 && (
                   <div className="flex flex-wrap gap-2 mb-3">
-                    {message.attachments.map((attachment) => (
+                    {message.attachments?.map((attachment) => (
                       <AttachmentPreview key={attachment.id} attachment={attachment} />
                     ))}
                   </div>

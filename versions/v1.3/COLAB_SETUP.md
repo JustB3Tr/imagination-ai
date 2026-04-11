@@ -98,6 +98,32 @@ os.environ.setdefault("IMAGINATION_ROOT", "/content/imagination-v1.1.0")
 
 Use the printed **local** URL or **`*.gradio.live`** if `GRADIO_SHARE` is enabled. In Colab you can also use the **ports** UI for `7860`.
 
+### FastAPI-only backend (`colab_backend.py`) + Tailscale
+
+For a **remote frontend** (e.g. v0) over Tailscale, start the FastAPI app from a **Python cell** in the same kernel where Colab Secrets work. Do **not** call `uvicorn.run()` in the **main** notebook thread — Jupyter already runs an asyncio loop.
+
+**Recommended (subprocess):** Uvicorn runs in a **child process** (no notebook event loop). Set secrets into `os.environ` in the kernel first; the child inherits them.
+
+```python
+%cd /content/imagination-v1.1.0/versions/v1.3
+import os
+from google.colab import userdata
+
+os.environ.setdefault("IMAGINATION_ROOT", "/content/imagination-v1.1.0")
+os.environ["TAILSCALE_KEY"] = userdata.get("TAILSCALE_KEY")
+
+from colab_backend import run_colab_backend_subprocess
+run_colab_backend_subprocess(port=8000)
+```
+
+**Alternative (background thread):** `run_colab_backend_server(port=8000)` — or, without those helpers, run `asyncio.run(uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=8000)).serve())` inside `threading.Thread(target=...)`.
+
+If you see `RuntimeWarning: coroutine 'Server.serve' was never awaited`, it is often **noise from IPython/Colab**; confirm the server with `!curl -s http://127.0.0.1:8000/health` after startup logs show the model is ready. If `/health` never responds, prefer the **subprocess** cell above.
+
+If helpers are missing (`ImportError`), refresh `/content` from git/Drive or use `!python colab_backend.py` after exporting `TAILSCALE_KEY` for that shell.
+
+From a shell, `python colab_backend.py` is unchanged (fresh process).
+
 **One cell after mount** (setup + then `app.py` in a subprocess — same as running `app.py` yourself after Cell 3):
 
 ```python
@@ -117,9 +143,11 @@ Requires **Node.js** and **`npm install`** in the frontend once per runtime (or 
 !node -v && npm -v
 ```
 
-#### Cell 4b — Frontend dependencies (**required** for the orchestrator)
+#### Cell 4b — Frontend dependencies (optional if the orchestrator auto-installs)
 
-Without this, Next will fail with **`sh: 1: next: not found`** (no local `node_modules/.bin/next`).
+On **Colab**, `colab_fullstack_orchestrator.py` runs **`npm install`** in the frontend folder **automatically** when `node_modules` is missing (unless you set **`COLAB_STACK_AUTO_NPM_INSTALL=0`**). You still need **`npm`** on the machine (Cell 4a).
+
+You can still run install yourself (faster to cache, or to debug):
 
 ```python
 %cd "/content/imagination-v1.1.0/versions/v1.3/front&back/frontend"
@@ -174,6 +202,7 @@ Point the Next app at the Flask bridge (e.g. `NEXT_PUBLIC_*` or server routes) a
 | `AI_READY_TIMEOUT_S` | Max seconds to wait for AI `/api/health` (orchestrator). |
 | `AI_WAIT_STATUS_INTERVAL_S` | Seconds between heartbeat prints + log tail while waiting (default `30`). |
 | `COLAB_STACK_LOG_DIR` | Directory for AI/Flask log files (orchestrator). |
+| `COLAB_STACK_AUTO_NPM_INSTALL` | `0` = never auto-run `npm install` for Next; `1` = always; unset = **on in Colab only**. |
 
 Other tuning (tokens, coder, training log, etc.) matches `colab_setup.py` docstring and `app.py` / runtime env docs.
 
@@ -185,11 +214,11 @@ See [DRIVE_SYNC.md](DRIVE_SYNC.md) (Drive for desktop, rclone, or Git).
 
 ---
 
-## `next: not found` when the orchestrator starts Next
+## `next: not found` / “Next.js dependencies still missing”
 
-You skipped **`npm install`** in `front&back/frontend`, so there is no `node_modules/.bin/next`. Run **Cell 4b**, then run the orchestrator again.
+Usually means **`npm install` never completed** in `front&back/frontend` (or **`npm` isn’t installed**). On Colab, the orchestrator **auto-runs `npm install`** there when `node_modules` is missing unless **`COLAB_STACK_AUTO_NPM_INSTALL=0`**.
 
-The orchestrator now calls that binary **directly** (instead of `npm run dev`) so Colab’s shell does not need `next` on the global PATH.
+The orchestrator runs the local **`node_modules/.bin/next`** (not global `next` on `PATH`).
 
 ---
 

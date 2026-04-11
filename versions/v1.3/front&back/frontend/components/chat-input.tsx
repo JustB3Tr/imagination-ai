@@ -48,115 +48,13 @@ function formatFileSize(bytes: number): string {
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
-// Smart math response generator
-function generateMathResponse(userMessage: string, attachments?: Attachment[]): string {
-  const lowerMessage = userMessage.toLowerCase();
-  
-  // Check if there are attachments
-  if (attachments && attachments.length > 0) {
-    const attachmentDescriptions = attachments.map(a => {
-      if (a.type === 'image') return `an image "${a.name}"`;
-      if (a.type === 'code') return `a code file "${a.name}"`;
-      return `a document "${a.name}"`;
-    }).join(', ');
-    
-    const hasCode = attachments.some(a => a.type === 'code');
-    const hasImage = attachments.some(a => a.type === 'image');
-    
-    if (hasCode) {
-      const codeFile = attachments.find(a => a.type === 'code');
-      return `I can see you've shared ${attachmentDescriptions}.\n\n**File Analysis:**\n- **Name:** ${codeFile?.name}\n- **Size:** ${formatFileSize(codeFile?.size || 0)}\n\nI'd be happy to help you with this code! Here are some things I can do:\n\n1. **Review** the code for potential issues\n2. **Explain** what the code does\n3. **Optimize** or refactor it\n4. **Debug** any problems\n\nWhat would you like me to help with?`;
-    }
-    
-    if (hasImage) {
-      return `I can see you've shared ${attachmentDescriptions}.\n\nI can analyze images for:\n- **Content description** - What's in the image\n- **Text extraction** (OCR)\n- **Code from screenshots**\n- **Design feedback**\n\nHow can I help you with this image?`;
-    }
-    
-    return `I've received ${attachmentDescriptions}.\n\nI can help you:\n- **Summarize** the content\n- **Extract** key information\n- **Answer questions** about it\n\nWhat would you like to know?`;
-  }
-  
-  // Square root questions
-  if (lowerMessage.includes('square root') || lowerMessage.includes('sqrt')) {
-    const numberMatch = userMessage.match(/\d+/);
-    if (numberMatch) {
-      const num = parseInt(numberMatch[0]);
-      const sqrt = Math.sqrt(num);
-      const isWhole = Number.isInteger(sqrt);
-      return `The square root of ${num} is:\n\n$$\\sqrt{${num}} = ${isWhole ? sqrt : sqrt.toFixed(4)}$$\n\n${isWhole ? `This is a perfect square because $${sqrt} \\times ${sqrt} = ${num}$` : `This is not a perfect square. The result is approximately $${sqrt.toFixed(4)}$`}`;
-    }
-  }
-  
-  // Fraction questions
-  if (lowerMessage.includes('fraction') || lowerMessage.includes('divide') || lowerMessage.includes('divided by')) {
-    const numbers = userMessage.match(/-?\d+/g);
-    if (numbers && numbers.length >= 2) {
-      const a = parseInt(numbers[0]);
-      const b = parseInt(numbers[1]);
-      if (b !== 0) {
-        return `When you divide ${a} by ${b}, you get:\n\n$$\\frac{${a}}{${b}} = ${(a/b).toFixed(4)}$$\n\nThis can be written as the fraction $\\frac{${a}}{${b}}$ or approximately $${(a/b).toFixed(2)}$ in decimal form.`;
-      }
-    }
-  }
-  
-  // Power/exponent questions
-  if (lowerMessage.includes('power') || lowerMessage.includes('squared') || lowerMessage.includes('cubed') || lowerMessage.includes('^')) {
-    const numbers = userMessage.match(/\d+/g);
-    if (numbers && numbers.length >= 1) {
-      const base = parseInt(numbers[0]);
-      const exp = lowerMessage.includes('cubed') ? 3 : lowerMessage.includes('squared') ? 2 : (numbers[1] ? parseInt(numbers[1]) : 2);
-      return `The result of ${base} raised to the power of ${exp} is:\n\n$$${base}^{${exp}} = ${Math.pow(base, exp)}$$\n\nThis means multiplying ${base} by itself ${exp} times.`;
-    }
-  }
-  
-  // General math keywords
-  if (lowerMessage.includes('quadratic') || lowerMessage.includes('equation')) {
-    return `The **quadratic formula** is used to solve equations of the form $ax^2 + bx + c = 0$:\n\n$$x = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}$$\n\nWhere:\n- $a$, $b$, and $c$ are coefficients\n- The $\\pm$ indicates two solutions\n- $b^2 - 4ac$ is called the discriminant`;
-  }
-  
-  if (lowerMessage.includes('pythagorean') || lowerMessage.includes('triangle')) {
-    return `The **Pythagorean theorem** states that for a right triangle:\n\n$$a^2 + b^2 = c^2$$\n\nWhere $c$ is the hypotenuse (longest side) and $a$ and $b$ are the other two sides.\n\nTo find the hypotenuse: $c = \\sqrt{a^2 + b^2}$`;
-  }
-  
-  if (lowerMessage.includes('derivative') || lowerMessage.includes('calculus')) {
-    return `Here are some common **derivative** rules:\n\n**Power Rule:**\n$$\\frac{d}{dx}x^n = nx^{n-1}$$\n\n**Product Rule:**\n$$\\frac{d}{dx}[f(x)g(x)] = f'(x)g(x) + f(x)g'(x)$$\n\n**Chain Rule:**\n$$\\frac{d}{dx}f(g(x)) = f'(g(x)) \\cdot g'(x)$$`;
-  }
-  
-  if (lowerMessage.includes('integral') || lowerMessage.includes('integrate')) {
-    return `Here's a famous integral - the **Gaussian integral**:\n\n$$\\int_{-\\infty}^{\\infty} e^{-x^2} dx = \\sqrt{\\pi}$$\n\nAnd the general power rule for integration:\n\n$$\\int x^n dx = \\frac{x^{n+1}}{n+1} + C$$\n\nwhere $C$ is the constant of integration.`;
-  }
-  
-  // Simple arithmetic
-  const mathPattern = /(\d+)\s*([+\-*/×÷])\s*(\d+)/;
-  const match = userMessage.match(mathPattern);
-  if (match) {
-    const a = parseFloat(match[1]);
-    const op = match[2];
-    const b = parseFloat(match[3]);
-    let result: number;
-    let opSymbol: string;
-    
-    switch (op) {
-      case '+': result = a + b; opSymbol = '+'; break;
-      case '-': result = a - b; opSymbol = '-'; break;
-      case '*': case '×': result = a * b; opSymbol = '\\times'; break;
-      case '/': case '÷': result = a / b; opSymbol = '\\div'; break;
-      default: result = 0; opSymbol = op;
-    }
-    
-    return `The answer is:\n\n$$${a} ${opSymbol} ${b} = ${result}$$`;
-  }
-  
-  // Default response
-  return `I'd be happy to help! Here's some mathematical context:\n\nEuler's identity is often called the most beautiful equation in mathematics:\n\n$$e^{i\\pi} + 1 = 0$$\n\nThis remarkable equation connects five fundamental constants:\n- $e$ (Euler's number)\n- $i$ (imaginary unit)\n- $\\pi$ (pi)\n- $1$ (unity)\n- $0$ (zero)\n\nFeel free to ask me any math questions, and I'll show you the formulas!`;
-}
-
 export function ChatInput() {
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const { addMessage, currentChatId, createNewChat } = useChatContext();
+  const { sendChatToBackend } = useChatContext();
 
   useEffect(() => {
     if (textareaRef.current) {
@@ -227,25 +125,20 @@ export function ChatInput() {
   const handleSubmit = async () => {
     if ((!input.trim() && attachments.length === 0) || isLoading) return;
 
-    if (!currentChatId) {
-      createNewChat();
-    }
-
     const userMessage = input.trim();
     const currentAttachments = [...attachments];
     setInput('');
     setAttachments([]);
     setIsLoading(true);
 
-    // Add user message with attachments
-    addMessage(userMessage || 'Attached files', 'user', currentAttachments.length > 0 ? currentAttachments : undefined);
-
-    // Simulate AI response
-    setTimeout(() => {
-      const response = generateMathResponse(userMessage, currentAttachments);
-      addMessage(response, 'assistant');
+    try {
+      await sendChatToBackend(
+        userMessage || 'Attached files',
+        currentAttachments.length > 0 ? currentAttachments : undefined
+      );
+    } finally {
       setIsLoading(false);
-    }, 1500);
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {

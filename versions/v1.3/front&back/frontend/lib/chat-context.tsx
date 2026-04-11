@@ -3,6 +3,11 @@
 import { createContext, useContext, useState, useCallback, type ReactNode } from 'react';
 import type { Attachment, Chat, Message, ModelType, User } from './types';
 
+export type AddMessageOptions = {
+  /** When set, append to this chat instead of `currentChatId` (e.g. right after `createNewChat()`). */
+  chatId?: string | null;
+};
+
 interface ChatContextType {
   chats: Chat[];
   currentChatId: string | null;
@@ -11,10 +16,20 @@ interface ChatContextType {
   isAuthenticated: boolean;
   showAuthModal: boolean;
   setShowAuthModal: (show: boolean) => void;
-  createNewChat: () => void;
+  createNewChat: () => string;
   selectChat: (chatId: string) => void;
   deleteChat: (chatId: string) => void;
-  addMessage: (content: string, role: 'user' | 'assistant', attachments?: Attachment[]) => void;
+  addMessage: (
+    content: string,
+    role: 'user' | 'assistant',
+    attachments?: Attachment[],
+    options?: AddMessageOptions
+  ) => void;
+  /**
+   * POST same-origin `/api/chat` with `{ prompt, currentModel, messages }`.
+   * The Route Handler proxies to Imagination using `NEXT_PUBLIC_API_URL` (see `app/api/chat/route.ts`).
+   */
+  sendChatToBackend: (userText: string, attachments?: Attachment[]) => Promise<void>;
   setCurrentModel: (model: ModelType) => void;
   signIn: (email: string, password: string) => Promise<void>;
   signOut: () => void;
@@ -25,74 +40,30 @@ const ChatContext = createContext<ChatContextType | undefined>(undefined);
 
 const generateId = () => Math.random().toString(36).substring(2, 15);
 
-// Demo message with KaTeX math rendering
-const demoMessages: Message[] = [
-  {
-    id: generateId(),
-    role: 'user',
-    content: 'Can you explain how to solve a simple fraction like dividing 3 by -2?',
-    createdAt: new Date(Date.now() - 60000),
-  },
-  {
-    id: generateId(),
-    role: 'assistant',
-    content: `Of course! When you divide 3 by -2, you get a negative fraction.
+const initialChats: Chat[] = [];
 
-The result is: $\\frac{3}{-2}$
-
-This can also be written as $-\\frac{3}{2}$ or approximately $-1.5$.
-
-**Key points to remember:**
-- When dividing a positive by a negative, the result is negative
-- The fraction $\\frac{3}{-2}$ equals $\\frac{-3}{2}$ equals $-\\frac{3}{2}$
-- In decimal form: $-1.5$
-
-Here's another example with the quadratic formula: $x = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}$`,
-    createdAt: new Date(),
-  },
-];
-
-const initialChats: Chat[] = [
-  {
-    id: generateId(),
-    title: 'Math Fractions Help',
-    messages: demoMessages,
-    createdAt: new Date(),
-    model: 'imagination-1.3',
-  },
-  {
-    id: generateId(),
-    title: 'Code Review Assistant',
-    messages: [],
-    createdAt: new Date(Date.now() - 86400000),
-    model: 'imagination-1.3-coder',
-  },
-  {
-    id: generateId(),
-    title: 'Creative Writing Ideas',
-    messages: [],
-    createdAt: new Date(Date.now() - 172800000),
-    model: 'imagination-1.3-pro',
-  },
-];
+const OFFLINE_ASSISTANT_MESSAGE =
+  'Imagination AI is currently offline. Please restart the Colab backend.';
 
 export function ChatProvider({ children }: { children: ReactNode }) {
   const [chats, setChats] = useState<Chat[]>(initialChats);
-  const [currentChatId, setCurrentChatId] = useState<string | null>(initialChats[0].id);
+  const [currentChatId, setCurrentChatId] = useState<string | null>(null);
   const [currentModel, setCurrentModel] = useState<ModelType>('imagination-1.3');
   const [user, setUser] = useState<User | null>(null);
   const [showAuthModal, setShowAuthModal] = useState(false);
 
-  const createNewChat = useCallback(() => {
+  const createNewChat = useCallback((): string => {
+    const id = generateId();
     const newChat: Chat = {
-      id: generateId(),
+      id,
       title: 'New Chat',
       messages: [],
       createdAt: new Date(),
       model: currentModel,
     };
     setChats(prev => [newChat, ...prev]);
-    setCurrentChatId(newChat.id);
+    setCurrentChatId(id);
+    return id;
   }, [currentModel]);
 
   const selectChat = useCallback((chatId: string) => {
@@ -104,34 +75,115 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   }, [chats]);
 
   const deleteChat = useCallback((chatId: string) => {
-    setChats(prev => prev.filter(c => c.id !== chatId));
-    if (currentChatId === chatId) {
-      setCurrentChatId(chats.length > 1 ? chats.find(c => c.id !== chatId)?.id || null : null);
-    }
-  }, [currentChatId, chats]);
-
-  const addMessage = useCallback((content: string, role: 'user' | 'assistant', attachments?: Attachment[]) => {
-    if (!currentChatId) return;
-
-    const newMessage: Message = {
-      id: generateId(),
-      role,
-      content,
-      attachments,
-      createdAt: new Date(),
-    };
-
-    setChats(prev => prev.map(chat => {
-      if (chat.id === currentChatId) {
-        const updatedMessages = [...chat.messages, newMessage];
-        const title = chat.messages.length === 0 && role === 'user' 
-          ? content.slice(0, 30) + (content.length > 30 ? '...' : '')
-          : chat.title;
-        return { ...chat, messages: updatedMessages, title };
+    setChats(prev => {
+      const next = prev.filter(c => c.id !== chatId);
+      if (currentChatId === chatId) {
+        setCurrentChatId(next[0]?.id ?? null);
       }
-      return chat;
-    }));
+      return next;
+    });
   }, [currentChatId]);
+
+  const addMessage = useCallback(
+    (
+      content: string,
+      role: 'user' | 'assistant',
+      attachments?: Attachment[],
+      options?: AddMessageOptions
+    ) => {
+      const targetId = options?.chatId ?? currentChatId;
+      if (!targetId) return;
+
+      const newMessage: Message = {
+        id: generateId(),
+        role,
+        content,
+        attachments,
+        createdAt: new Date(),
+      };
+
+      setChats(prev =>
+        prev.map(chat => {
+          if (chat.id === targetId) {
+            const updatedMessages = [...chat.messages, newMessage];
+            const title =
+              chat.messages.length === 0 && role === 'user'
+                ? content.slice(0, 30) + (content.length > 30 ? '...' : '')
+                : chat.title;
+            return { ...chat, messages: updatedMessages, title };
+          }
+          return chat;
+        })
+      );
+    },
+    [currentChatId]
+  );
+
+  const sendChatToBackend = useCallback(
+    async (userText: string, attachments?: Attachment[]) => {
+      let cid = currentChatId;
+      if (!cid) {
+        cid = createNewChat();
+      }
+
+      const priorMessages = (chats.find(c => c.id === cid)?.messages ?? []).map(m => ({
+        role: m.role,
+        content: m.content,
+      }));
+
+      let augmented = userText;
+      if (attachments?.length) {
+        const names = attachments.map(a => `${a.name} (${a.type})`).join(', ');
+        augmented = `[Attached: ${names}]\n\n${userText}`;
+      }
+
+      const history = [...priorMessages, { role: 'user' as const, content: augmented }];
+
+      addMessage(userText, 'user', attachments, { chatId: cid });
+
+      const chatPayload = {
+        prompt: userText,
+        currentModel,
+        messages: history.map(({ role, content }) => ({ role, content })),
+      };
+
+      try {
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify(chatPayload),
+        });
+
+        let data: { response?: string; error?: string; detail?: string } = {};
+        const ct = res.headers.get('content-type') || '';
+        if (ct.includes('application/json')) {
+          try {
+            data = (await res.json()) as typeof data;
+          } catch {
+            /* ignore */
+          }
+        }
+
+        if (!res.ok) {
+          const fallback =
+            typeof data.response === 'string' && data.response.trim()
+              ? data.response
+              : OFFLINE_ASSISTANT_MESSAGE;
+          addMessage(fallback, 'assistant', undefined, { chatId: cid });
+          return;
+        }
+
+        const text =
+          typeof data.response === 'string' ? data.response : '';
+        addMessage(text.trim() ? text : '(Empty response)', 'assistant', undefined, {
+          chatId: cid,
+        });
+      } catch {
+        addMessage(OFFLINE_ASSISTANT_MESSAGE, 'assistant', undefined, { chatId: cid });
+      }
+    },
+    [addMessage, chats, createNewChat, currentChatId, currentModel]
+  );
 
   const signIn = useCallback(async (email: string, _password: string) => {
     // Simulate authentication
@@ -166,6 +218,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         selectChat,
         deleteChat,
         addMessage,
+        sendChatToBackend,
         setCurrentModel,
         signIn,
         signOut,

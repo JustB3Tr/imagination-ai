@@ -48,7 +48,7 @@ export function ChatSidebar() {
       {/* Chat History */}
       <ScrollArea className="flex-1 px-2 py-2">
         <div className="space-y-1">
-          {chats.map((chat) => (
+          {chats?.map((chat) => (
             <div
               key={chat.id}
               className={cn(
