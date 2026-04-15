@@ -224,3 +224,7 @@ def attach_generation_routes(app: FastAPI) -> None:
                 "X-Accel-Buffering": "no",
             },
         )
+
+    from imagination_runtime.deep_research import attach_deep_and_sync_routes
+
+    attach_deep_and_sync_routes(app)

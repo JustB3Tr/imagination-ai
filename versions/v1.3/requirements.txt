@@ -7,6 +7,9 @@ bitsandbytes
 torch
 requests
 beautifulsoup4
+trafilatura
+chromadb
+sentence-transformers
 ddgs
 diffusers
 bcrypt
