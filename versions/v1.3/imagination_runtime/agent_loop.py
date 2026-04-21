@@ -41,11 +41,17 @@ read_file | write_file | run_shell | web_search | capture_ui
 There are NO other tools (no set_score, update_snake, game APIs, etc.). Implement games and logic with
 write_file and/or run_shell on files in the workspace.
 
-Schema for an action turn:
-{"thought":"...","tool_call":{"name":"read_file","args":{"path":"relative/path.py"}}}
+Schema for write_file (content is REQUIRED — the full file text, not just a path):
+{"thought":"...","tool_call":{"name":"write_file","args":{"path":"snake_game.py","content":"#!/usr/bin/env python3\\n...","reason":"create game"}}}
+
+Schema for read_file:
+{"thought":"...","tool_call":{"name":"read_file","args":{"path":"snake_game.py"}}}
 
 When done:
 {"thought":"...","final_answer":"what was done and what to do next","summary_report":{"files_modified":[{"path":"...","why":"..."}],"commands_run":[],"captures":[]}}
+
+final_answer must summarize ONLY real actions from this session (files written, commands run, tools used).
+Never describe game scores, movement, or UI behavior that you did not actually implement in file contents yet.
 
 If the model uses chain-of-thought, end the message with the JSON object as the last characters.
 """
@@ -469,6 +475,21 @@ class AgenticLoop:
             if tool_name == "read_file":
                 return True, self._tool_read_file(args)
             if tool_name == "write_file":
+                if "content" not in args:
+                    return False, {
+                        "error": (
+                            'write_file requires args["content"] — the complete file source as a string. '
+                            "You passed only a path."
+                        ),
+                    }
+                body = str(args.get("content") or "")
+                if not body.strip():
+                    return False, {
+                        "error": (
+                            "write_file requires non-empty content (full file body). "
+                            "Omitting or empty content creates useless empty files."
+                        ),
+                    }
                 return True, self._tool_write_file(args)
             if tool_name == "run_shell":
                 return self._tool_run_shell(args)
