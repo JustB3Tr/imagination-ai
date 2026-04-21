@@ -26,26 +26,28 @@ _SESSIONS_LOCK = Lock()
 _SESSIONS: Dict[str, "AgentSessionState"] = {}
 
 
-_DEFAULT_SYSTEM_PROMPT = """You are Imagination Composer, an autonomous coding agent.
-Return ONLY valid JSON for each turn with this schema:
-{
-  "thought": "short reasoning",
-  "tool_call": {
-    "name": "read_file|write_file|run_shell|web_search|capture_ui",
-    "args": { ... }
-  }
-}
+_ALLOWED_TOOL_NAMES = frozenset({"read_file", "write_file", "run_shell", "web_search", "capture_ui"})
 
-When done, return:
-{
-  "thought": "short reasoning",
-  "final_answer": "what was done and next action",
-  "summary_report": {
-    "files_modified": [{"path": "...", "why": "..."}],
-    "commands_run": ["..."],
-    "captures": [{"artifact_id": "...", "kind": "screenshot|video"}]
-  }
-}
+_DEFAULT_SYSTEM_PROMPT = """You are Imagination Composer, an autonomous coding agent.
+
+Each assistant turn must be ONE JSON object only (no markdown fences, no prose before or after the object).
+Put brief plans in the "thought" string, but every turn must ALSO include exactly one of:
+- "tool_call": { "name": "<tool>", "args": { ... } }  — to act, OR
+- "final_answer": "<string>" — to finish the task for this session.
+
+Allowed tool_call.name values ONLY (copy exactly, lowercase):
+read_file | write_file | run_shell | web_search | capture_ui
+
+There are NO other tools (no set_score, update_snake, game APIs, etc.). Implement games and logic with
+write_file and/or run_shell on files in the workspace.
+
+Schema for an action turn:
+{"thought":"...","tool_call":{"name":"read_file","args":{"path":"relative/path.py"}}}
+
+When done:
+{"thought":"...","final_answer":"what was done and what to do next","summary_report":{"files_modified":[{"path":"...","why":"..."}],"commands_run":[],"captures":[]}}
+
+If the model uses chain-of-thought, end the message with the JSON object as the last characters.
 """
 
 
@@ -165,20 +167,74 @@ def _read_text_safe(path: Path, *, max_bytes: int = 300_000) -> Tuple[str, bool]
     return raw.decode("utf-8", errors="replace"), clipped
 
 
-def _extract_json_object(text: str) -> Optional[JsonDict]:
+def _strip_composer_preamble(text: str) -> str:
+    """Remove common reasoning wrappers so a trailing JSON object can be parsed."""
     t = (text or "").strip()
+    t = re.sub(r"<thinking>.*?</thinking>", "", t, flags=re.DOTALL | re.IGNORECASE)
+    t = re.sub(r"<think>.*?</think>", "", t, flags=re.DOTALL | re.IGNORECASE)
+    # Some checkpoints emit  /  blocks (avoid angle brackets in source so editors don't strip).
+    _ot, _ct = "\u003cthink\u003e", "\u003c/think\u003e"
+    t = re.sub(_ot + r".*?" + _ct, "", t, flags=re.DOTALL | re.IGNORECASE)
+    t = re.sub(r"<reasoning>.*?</reasoning>", "", t, flags=re.DOTALL | re.IGNORECASE)
+    t = re.sub(r"(?is)^\s*thinking\s*[:.]?\s*\n+", "", t)
+    t = re.sub(r"(?is)^\s*reasoning\s*[:.]?\s*\n+", "", t)
+    return t.strip()
+
+
+def _collect_json_dict_candidates(t: str) -> List[JsonDict]:
+    """Parse every top-level JSON object in the string (handles prose + trailing JSON)."""
+    out: List[JsonDict] = []
+    dec = json.JSONDecoder()
+    i = 0
+    n = len(t)
+    while i < n:
+        while i < n and t[i] != "{":
+            i += 1
+        if i >= n:
+            break
+        try:
+            obj, end = dec.raw_decode(t, i)
+            if isinstance(obj, dict):
+                out.append(obj)
+            i = end
+        except json.JSONDecodeError:
+            i += 1
+    return out
+
+
+def _pick_agent_turn_dict(candidates: List[JsonDict]) -> Optional[JsonDict]:
+    if not candidates:
+        return None
+    for d in reversed(candidates):
+        if str(d.get("final_answer") or "").strip():
+            return d
+    for d in reversed(candidates):
+        tc = d.get("tool_call")
+        if isinstance(tc, dict) and str(tc.get("name") or "").strip():
+            return d
+    return candidates[-1]
+
+
+def _extract_json_object(text: str) -> Optional[JsonDict]:
+    t = _strip_composer_preamble(text)
     if not t:
         return None
     if t.startswith("```"):
         m = re.search(r"```(?:json)?\s*([\s\S]*?)```", t, re.IGNORECASE)
         if m:
             t = m.group(1).strip()
+
     try:
         loaded = json.loads(t)
         if isinstance(loaded, dict):
             return loaded
     except Exception:
         pass
+
+    candidates = _collect_json_dict_candidates(t)
+    picked = _pick_agent_turn_dict(candidates)
+    if picked is not None:
+        return picked
 
     start = t.find("{")
     end = t.rfind("}")
@@ -279,19 +335,33 @@ class AgenticLoop:
         yield {"type": "workspace_tree", **workspace_tree(self.state.workspace_root)}
 
         final_answer = ""
+        fail_streak = 0
+        _allowed = ", ".join(sorted(_ALLOWED_TOOL_NAMES))
+        _break_after_failures = 8
+
         for _ in range(self.max_tool_iters):
             raw = self.model_generate(convo, self.max_new_tokens)
             parsed = _extract_json_object(raw)
             if not parsed:
+                fail_streak += 1
                 err = "Model did not return valid JSON object"
                 yield {"type": "error", "message": err}
                 convo.append({"role": "assistant", "content": raw})
                 convo.append(
                     {
                         "role": "system",
-                        "content": "Return valid JSON exactly following the schema. No markdown fences.",
+                        "content": (
+                            "Reply with ONE JSON object only (no markdown). End the message with that object. "
+                            "Include tool_call OR final_answer in the same object as thought."
+                        ),
                     }
                 )
+                if fail_streak >= _break_after_failures:
+                    final_answer = (
+                        "Stopped after repeated non-JSON replies. Try a smaller step, disable long chain-of-thought "
+                        "if your stack allows it, or use a checkpoint that follows strict JSON instructions."
+                    )
+                    break
                 continue
 
             thought = str(parsed.get("thought") or "").strip()
@@ -304,18 +374,64 @@ class AgenticLoop:
 
             tool_call = parsed.get("tool_call")
             if not isinstance(tool_call, dict):
+                fail_streak += 1
                 yield {"type": "error", "message": "Missing tool_call or final_answer"}
                 convo.append({"role": "assistant", "content": json.dumps(parsed, ensure_ascii=False)})
                 convo.append(
                     {
                         "role": "system",
-                        "content": "Provide either tool_call or final_answer in the next JSON response.",
+                        "content": (
+                            "The JSON must include either final_answer (string) or tool_call "
+                            f'(object with name in [{_allowed}] and args). "thought" alone is not enough.'
+                        ),
                     }
                 )
+                if fail_streak >= _break_after_failures:
+                    final_answer = (
+                        "Stopped: the model kept returning JSON without tool_call or final_answer. "
+                        "Try rephrasing the task or lowering complexity."
+                    )
+                    break
                 continue
 
             tool_name = str(tool_call.get("name") or "").strip()
             args = tool_call.get("args") if isinstance(tool_call.get("args"), dict) else {}
+
+            if not tool_name:
+                fail_streak += 1
+                yield {"type": "error", "message": "tool_call.name is empty"}
+                convo.append({"role": "assistant", "content": json.dumps(parsed, ensure_ascii=False)})
+                convo.append(
+                    {
+                        "role": "system",
+                        "content": f"tool_call.name is required. Use one of: {_allowed}.",
+                    }
+                )
+                if fail_streak >= _break_after_failures:
+                    final_answer = "Stopped after repeated invalid tool_call.name values."
+                    break
+                continue
+
+            if tool_name not in _ALLOWED_TOOL_NAMES:
+                fail_streak += 1
+                msg = f"Invalid tool {tool_name!r}; allowed: {_allowed}"
+                yield {"type": "error", "message": msg}
+                convo.append({"role": "assistant", "content": json.dumps(parsed, ensure_ascii=False)})
+                convo.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            f"Tool {tool_name!r} does not exist. Use only: {_allowed}. "
+                            "Implement behavior with write_file / run_shell on workspace files."
+                        ),
+                    }
+                )
+                if fail_streak >= _break_after_failures:
+                    final_answer = "Stopped after repeated invalid tool names."
+                    break
+                continue
+
+            fail_streak = 0
             call_id = uuid.uuid4().hex[:10]
             yield {"type": "tool_call", "id": call_id, "name": tool_name, "args": args}
 
