@@ -70,3 +70,9 @@ Install with `pip install -r versions/v1.1.2/requirements.txt` plus `pip install
 - **Training exports**: turns append to `IMAGINATION_ROOT/temp/training_exports/training_turns.jsonl` (schema `imagination_turn_v2`) unless `IMAGINATION_TRAINING_LOG=0`
 
 Run the UI from `versions/v1.2.1/` with `IMAGINATION_ROOT` set: `python app.py`
+
+### v0-imagination-ui (Next.js frontend, separate repo)
+
+The Next app for Imagination UI lives in [`v0-imagination-ui/`](v0-imagination-ui/) and pushes to `https://github.com/JustB3Tr/v0-imagination-ui` (remote `origin` inside that folder).
+
+**Builds and npm on Google Drive:** The monorepo path under `G:\My Drive\...` is Google Drive. `npm install` / `next build` there often fails (tar checksum/write errors). **For agents (and humans) testing a frontend build:** clone or copy `v0-imagination-ui` to a **local disk** such as `C:\dev\v0-imagination-ui` and run `npm install` and `next build` / `next dev` there instead.
