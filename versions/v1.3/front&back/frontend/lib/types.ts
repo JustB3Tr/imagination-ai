@@ -8,12 +8,41 @@ export interface Attachment {
   content?: string; // For text/code files
 }
 
+/** Structured research / deep-mode trace event (mirrors backend NDJSON trace payloads). */
+export interface ResearchTraceEvent {
+  id: string;
+  ts: number;
+  step: string;
+  summary: string;
+  detail?: Record<string, unknown>;
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'assistant';
   content: string;
   attachments?: Attachment[];
   createdAt: Date;
+  /** Populated during deep research streaming */
+  researchTrace?: ResearchTraceEvent[];
+  answerPhase?: 'idle' | 'preliminary' | 'final';
+}
+
+export interface Chat {
+  id: string;
+  title: string;
+  messages: Message[];
+  createdAt: Date;
+  model: ModelType;
+}
+
+export type ModelType = 'imagination-1.3' | 'imagination-1.3-pro' | 'imagination-1.3-coder';
+
+export interface User {
+  id: string;
+  name: string;
+  email: string;
+  avatar?: string;
 }
 
 export interface WorkspaceTreeNode {
@@ -68,19 +97,14 @@ export interface MediaArtifact {
   src: string;
 }
 
-export interface Chat {
+/** Live NDJSON trace row for /agent (thought, tools, errors). */
+export interface AgentTraceEntry {
   id: string;
-  title: string;
-  messages: Message[];
-  createdAt: Date;
-  model: ModelType;
-}
-
-export type ModelType = 'imagination-1.3' | 'imagination-1.3-pro' | 'imagination-1.3-coder';
-
-export interface User {
-  id: string;
-  name: string;
-  email: string;
-  avatar?: string;
+  ts: number;
+  kind: 'thought' | 'tool_call' | 'tool_result' | 'error';
+  name?: string;
+  text?: string;
+  callId?: string;
+  detail?: string;
+  ok?: boolean;
 }

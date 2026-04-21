@@ -1,22 +1,37 @@
 'use client';
 
-import { createContext, useContext, useState, useCallback, type ReactNode } from 'react';
+import {
+  createContext,
+  useContext,
+  useState,
+  useCallback,
+  useEffect,
+  useRef,
+  type ReactNode,
+} from 'react';
+import { useSession, signIn as nextAuthSignIn, signOut as nextAuthSignOut } from 'next-auth/react';
 import type {
+  AgentTraceEntry,
   Attachment,
   Chat,
   DiffProposal,
   MediaArtifact,
   Message,
   ModelType,
+  ResearchTraceEvent,
   SummaryReport,
   TerminalRun,
   User,
   WorkspaceSnapshot,
 } from './types';
-
-export type AddMessageOptions = {
-  chatId?: string | null;
-};
+import { deriveChatTitle } from './chat-title';
+import {
+  loadAppState,
+  saveAppState,
+  chatsToJsonlLines,
+  type PersistedChat,
+  type PersistedMessage,
+} from './local-chat-store';
 
 interface ChatContextType {
   chats: Chat[];
@@ -26,6 +41,9 @@ interface ChatContextType {
   isAuthenticated: boolean;
   showAuthModal: boolean;
   setShowAuthModal: (show: boolean) => void;
+  storageHydrated: boolean;
+  deepResearchActive: boolean;
+  setDeepResearchActive: (v: boolean) => void;
   createNewChat: () => string;
   selectChat: (chatId: string) => void;
   deleteChat: (chatId: string) => void;
@@ -33,16 +51,33 @@ interface ChatContextType {
     content: string,
     role: 'user' | 'assistant',
     attachments?: Attachment[],
-    options?: AddMessageOptions
+    forChatId?: string | null
+  ) => string | undefined;
+  updateMessageContent: (
+    messageId: string,
+    content: string,
+    forChatId?: string | null
   ) => void;
-  sendChatToBackend: (userText: string, attachments?: Attachment[]) => Promise<void>;
-  sendAgentChatToBackend: (userText: string, attachments?: Attachment[]) => Promise<void>;
-  applyDiffProposals: (proposalIds: string[]) => Promise<void>;
-  refreshWorkspaceTree: () => Promise<void>;
+  updateMessageFields: (
+    messageId: string,
+    patch: Partial<Pick<Message, 'content' | 'researchTrace' | 'answerPhase'>>,
+    forChatId?: string | null
+  ) => void;
+  appendResearchTrace: (
+    messageId: string,
+    event: ResearchTraceEvent,
+    forChatId?: string | null
+  ) => void;
   setCurrentModel: (model: ModelType) => void;
   signIn: (email: string, password: string) => Promise<void>;
   signOut: () => void;
   getCurrentChat: () => Chat | undefined;
+  exportChatsJsonl: (scope?: 'all' | 'current') => void;
+  syncChatsFromBackend: () => Promise<{ merged: number; error?: string }>;
+  pushChatsToBackend: () => Promise<{ ok: boolean; error?: string }>;
+  sendAgentChatToBackend: (userText: string, attachments?: Attachment[]) => Promise<void>;
+  applyDiffProposals: (proposalIds: string[]) => Promise<void>;
+  refreshWorkspaceTree: () => Promise<void>;
   agentSessionId: string | null;
   workspaceSnapshot: WorkspaceSnapshot | null;
   terminalRuns: TerminalRun[];
@@ -50,25 +85,65 @@ interface ChatContextType {
   mediaArtifacts: MediaArtifact[];
   summaryReport: SummaryReport | null;
   isAgentRunning: boolean;
+  agentTrace: AgentTraceEntry[];
 }
 
 const ChatContext = createContext<ChatContextType | undefined>(undefined);
 
 const generateId = () => Math.random().toString(36).substring(2, 15);
-const initialChats: Chat[] = [];
 
 const OFFLINE_ASSISTANT_MESSAGE =
   'Imagination AI is currently offline. Please restart the backend.';
 
 type AgentEvent = Record<string, unknown>;
 
+function persistedToChat(c: PersistedChat): Chat {
+  return {
+    id: c.id,
+    title: c.title,
+    model: c.model,
+    createdAt: new Date(c.createdAt),
+    messages: c.messages.map(m => ({
+      id: m.id,
+      role: m.role,
+      content: m.content,
+      attachments: m.attachments,
+      createdAt: new Date(m.createdAt),
+      researchTrace: m.researchTrace,
+      answerPhase: m.answerPhase,
+    })),
+  };
+}
+
+function chatToPersisted(c: Chat): PersistedChat {
+  const messages: PersistedMessage[] = c.messages.map(m => ({
+    id: m.id,
+    role: m.role,
+    content: m.content,
+    attachments: m.attachments,
+    createdAt: m.createdAt.toISOString(),
+    researchTrace: m.researchTrace,
+    answerPhase: m.answerPhase,
+  }));
+  return {
+    id: c.id,
+    title: c.title,
+    model: c.model,
+    createdAt: c.createdAt.toISOString(),
+    messages,
+  };
+}
+
 export function ChatProvider({ children }: { children: ReactNode }) {
-  const [chats, setChats] = useState<Chat[]>(initialChats);
+  const { data: session, status: sessionStatus } = useSession();
+  const [chats, setChats] = useState<Chat[]>([]);
   const [currentChatId, setCurrentChatId] = useState<string | null>(null);
   const [currentModel, setCurrentModel] = useState<ModelType>('imagination-1.3');
   const [user, setUser] = useState<User | null>(null);
   const [showAuthModal, setShowAuthModal] = useState(false);
-
+  const [storageHydrated, setStorageHydrated] = useState(false);
+  const [deepResearchActive, setDeepResearchActive] = useState(false);
+  const agentSessionIdRef = useRef<string | null>(null);
   const [agentSessionId, setAgentSessionId] = useState<string | null>(null);
   const [workspaceSnapshot, setWorkspaceSnapshot] = useState<WorkspaceSnapshot | null>(null);
   const [terminalRuns, setTerminalRuns] = useState<TerminalRun[]>([]);
@@ -76,30 +151,102 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const [mediaArtifacts, setMediaArtifacts] = useState<MediaArtifact[]>([]);
   const [summaryReport, setSummaryReport] = useState<SummaryReport | null>(null);
   const [isAgentRunning, setIsAgentRunning] = useState(false);
+  const [agentTrace, setAgentTrace] = useState<AgentTraceEntry[]>([]);
+  const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const latestRef = useRef({ chats, currentChatId, currentModel });
+  latestRef.current = { chats, currentChatId, currentModel };
+
+  useEffect(() => {
+    if (session?.user) {
+      const u = session.user;
+      setUser({
+        id: (u as { id?: string }).id ?? u.email ?? generateId(),
+        name: u.name ?? (u.email ? u.email.split('@')[0] : 'User'),
+        email: u.email ?? '',
+        avatar: u.image ?? undefined,
+      });
+    } else if (sessionStatus === 'unauthenticated') {
+      setUser(null);
+    }
+  }, [session, sessionStatus]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const raw = await loadAppState();
+      if (cancelled) return;
+      if (raw && raw.chats?.length) {
+        setChats(raw.chats.map(persistedToChat));
+        setCurrentChatId(raw.currentChatId ?? raw.chats[0]?.id ?? null);
+        setCurrentModel(raw.currentModel ?? 'imagination-1.3');
+      }
+      setStorageHydrated(true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const schedulePersist = useCallback(() => {
+    if (!storageHydrated) return;
+    if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+    persistTimerRef.current = setTimeout(() => {
+      persistTimerRef.current = null;
+      void (async () => {
+        const { chats: c, currentChatId: id, currentModel: m } = latestRef.current;
+        const state = {
+          chats: c.map(chatToPersisted),
+          currentChatId: id,
+          currentModel: m,
+          updatedAt: new Date().toISOString(),
+        };
+        await saveAppState(state);
+      })();
+    }, 400);
+  }, [storageHydrated]);
+
+  useEffect(() => {
+    schedulePersist();
+    return () => {
+      if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+    };
+  }, [chats, currentChatId, currentModel, schedulePersist]);
+
+  useEffect(() => {
+    if (!storageHydrated) return;
+    const flush = () => {
+      const { chats: c, currentChatId: id, currentModel: m } = latestRef.current;
+      void saveAppState({
+        chats: c.map(chatToPersisted),
+        currentChatId: id,
+        currentModel: m,
+        updatedAt: new Date().toISOString(),
+      });
+    };
+    window.addEventListener('beforeunload', flush);
+    return () => window.removeEventListener('beforeunload', flush);
+  }, [storageHydrated]);
 
   const createNewChat = useCallback((): string => {
-    const id = generateId();
     const newChat: Chat = {
-      id,
+      id: generateId(),
       title: 'New Chat',
       messages: [],
       createdAt: new Date(),
       model: currentModel,
     };
     setChats(prev => [newChat, ...prev]);
-    setCurrentChatId(id);
-    return id;
+    setCurrentChatId(newChat.id);
+    return newChat.id;
   }, [currentModel]);
 
   const selectChat = useCallback(
     (chatId: string) => {
       setCurrentChatId(chatId);
-      const chat = chats.find(c => c.id === chatId);
-      if (chat) {
-        setCurrentModel(chat.model);
-      }
+      const chat = latestRef.current.chats.find(c => c.id === chatId);
+      if (chat) setCurrentModel(chat.model);
     },
-    [chats]
+    []
   );
 
   const deleteChat = useCallback(
@@ -120,10 +267,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       content: string,
       role: 'user' | 'assistant',
       attachments?: Attachment[],
-      options?: AddMessageOptions
-    ) => {
-      const targetId = options?.chatId ?? currentChatId;
-      if (!targetId) return;
+      forChatId?: string | null
+    ): string | undefined => {
+      const chatId = forChatId ?? currentChatId;
+      if (!chatId) return undefined;
 
       const newMessage: Message = {
         id: generateId(),
@@ -131,24 +278,190 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         content,
         attachments,
         createdAt: new Date(),
+        answerPhase: role === 'assistant' ? 'idle' : undefined,
       };
 
       setChats(prev =>
         prev.map(chat => {
-          if (chat.id === targetId) {
-            const updatedMessages = [...chat.messages, newMessage];
-            const title =
-              chat.messages.length === 0 && role === 'user'
-                ? content.slice(0, 30) + (content.length > 30 ? '...' : '')
-                : chat.title;
-            return { ...chat, messages: updatedMessages, title };
-          }
-          return chat;
+          if (chat.id !== chatId) return chat;
+          const updatedMessages = [...chat.messages, newMessage];
+          const title =
+            chat.messages.length === 0 && role === 'user'
+              ? deriveChatTitle(content)
+              : chat.title;
+          return { ...chat, messages: updatedMessages, title };
+        })
+      );
+      return newMessage.id;
+    },
+    [currentChatId]
+  );
+
+  const updateMessageContent = useCallback(
+    (messageId: string, content: string, forChatId?: string | null) => {
+      const chatId = forChatId ?? currentChatId;
+      if (!chatId) return;
+
+      setChats(prev =>
+        prev.map(chat => {
+          if (chat.id !== chatId) return chat;
+          return {
+            ...chat,
+            messages: chat.messages.map(m =>
+              m.id === messageId ? { ...m, content } : m
+            ),
+          };
         })
       );
     },
     [currentChatId]
   );
+
+  const updateMessageFields = useCallback(
+    (
+      messageId: string,
+      patch: Partial<Pick<Message, 'content' | 'researchTrace' | 'answerPhase'>>,
+      forChatId?: string | null
+    ) => {
+      const chatId = forChatId ?? currentChatId;
+      if (!chatId) return;
+
+      setChats(prev =>
+        prev.map(chat => {
+          if (chat.id !== chatId) return chat;
+          return {
+            ...chat,
+            messages: chat.messages.map(m =>
+              m.id === messageId ? { ...m, ...patch } : m
+            ),
+          };
+        })
+      );
+    },
+    [currentChatId]
+  );
+
+  const appendResearchTrace = useCallback(
+    (messageId: string, event: ResearchTraceEvent, forChatId?: string | null) => {
+      const chatId = forChatId ?? currentChatId;
+      if (!chatId) return;
+
+      setChats(prev =>
+        prev.map(chat => {
+          if (chat.id !== chatId) return chat;
+          return {
+            ...chat,
+            messages: chat.messages.map(m => {
+              if (m.id !== messageId) return m;
+              const next = [...(m.researchTrace ?? []), event];
+              return { ...m, researchTrace: next };
+            }),
+          };
+        })
+      );
+    },
+    [currentChatId]
+  );
+
+  const signIn = useCallback(async (email: string, password: string) => {
+    const res = await nextAuthSignIn('credentials', {
+      email,
+      password,
+      redirect: false,
+    });
+    if (res?.error) {
+      throw new Error(res.error);
+    }
+    setShowAuthModal(false);
+  }, []);
+
+  const signOut = useCallback(async () => {
+    await nextAuthSignOut({ redirect: false });
+    setUser(null);
+  }, []);
+
+  const getCurrentChat = useCallback(() => {
+    return chats.find(c => c.id === currentChatId);
+  }, [chats, currentChatId]);
+
+  const exportChatsJsonl = useCallback(
+    (scope: 'all' | 'current' = 'all') => {
+      const list =
+        scope === 'current' && currentChatId
+          ? chats.filter(c => c.id === currentChatId)
+          : chats;
+      const blob = new Blob([chatsToJsonlLines(list.map(chatToPersisted))], {
+        type: 'application/x-ndjson',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download =
+        scope === 'current' && currentChatId
+          ? `imagination-chat-${currentChatId}.jsonl`
+          : 'imagination-chats-export.jsonl';
+      a.click();
+      URL.revokeObjectURL(url);
+    },
+    [chats, currentChatId]
+  );
+
+  const syncChatsFromBackend = useCallback(async () => {
+    try {
+      const res = await fetch('/api/sync/chats', { method: 'GET' });
+      if (!res.ok) {
+        const t = await res.text();
+        return { merged: 0, error: t || res.statusText };
+      }
+      const data = (await res.json()) as { chats?: PersistedChat[] };
+      const remote = data.chats ?? [];
+      if (!remote.length) return { merged: 0 };
+
+      setChats(prev => {
+        const byId = new Map(prev.map(c => [c.id, c]));
+        let merged = 0;
+        for (const pc of remote) {
+          const incoming = persistedToChat(pc);
+          const existing = byId.get(incoming.id);
+          if (!existing) {
+            byId.set(incoming.id, incoming);
+            merged += 1;
+            continue;
+          }
+          const exT = existing.createdAt.getTime();
+          const inT = incoming.createdAt.getTime();
+          if (inT >= exT) {
+            byId.set(incoming.id, incoming);
+            merged += 1;
+          }
+        }
+        return Array.from(byId.values()).sort(
+          (a, b) => b.createdAt.getTime() - a.createdAt.getTime()
+        );
+      });
+      return { merged: remote.length };
+    } catch (e) {
+      return { merged: 0, error: String(e) };
+    }
+  }, []);
+
+  const pushChatsToBackend = useCallback(async () => {
+    try {
+      const body = { chats: chats.map(chatToPersisted) };
+      const res = await fetch('/api/sync/chats', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const t = await res.text();
+        return { ok: false, error: t || res.statusText };
+      }
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: String(e) };
+    }
+  }, [chats]);
 
   const refreshWorkspaceTree = useCallback(async () => {
     if (!agentSessionId) return;
@@ -162,7 +475,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       const data = (await res.json()) as WorkspaceSnapshot;
       setWorkspaceSnapshot(data);
     } catch {
-      // best-effort refresh
+      /* ignore */
     }
   }, [agentSessionId]);
 
@@ -170,46 +483,111 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     const type = String(event.type || '');
     if (type === 'session') {
       const sid = String(event.session_id || '');
-      if (sid) setAgentSessionId(sid);
+      if (sid) {
+        setAgentSessionId(sid);
+        agentSessionIdRef.current = sid;
+      }
       return;
     }
 
     if (type === 'workspace_tree') {
       setWorkspaceSnapshot({
         root: String(event.root || ''),
-        session_id: agentSessionId || String(event.session_id || ''),
+        session_id:
+          String(event.session_id || '') || agentSessionIdRef.current || '',
         tree: (event.tree as WorkspaceSnapshot['tree']) ?? null,
         truncated: Boolean(event.truncated),
       });
       return;
     }
 
-    if (type === 'tool_call' && String(event.name || '') === 'run_shell') {
-      const id = String(event.id || generateId());
-      const args = (event.args ?? {}) as Record<string, unknown>;
-      const command = String(args.command || args.cmd || '');
-      setTerminalRuns(prev => [...prev, { id, command, status: 'running' }]);
+    if (type === 'thought') {
+      const t = String(event.text || '').trim();
+      if (t) {
+        setAgentTrace(prev => [
+          ...prev,
+          { id: generateId(), ts: Date.now(), kind: 'thought', text: t },
+        ]);
+      }
       return;
     }
 
-    if (type === 'tool_result' && String(event.name || '') === 'run_shell') {
-      const id = String(event.id || '');
+    if (type === 'error') {
+      const msg = String(
+        (event as { message?: string }).message ||
+          (event as { error?: string }).error ||
+          ''
+      ).trim();
+      if (msg) {
+        setAgentTrace(prev => [
+          ...prev,
+          { id: generateId(), ts: Date.now(), kind: 'error', text: msg },
+        ]);
+      }
+      return;
+    }
+
+    if (type === 'tool_call') {
+      const callId = String(event.id || generateId());
+      const name = String(event.name || '').trim();
+      const args = (event.args ?? {}) as Record<string, unknown>;
+      const detail =
+        name === 'run_shell'
+          ? String(args.command || args.cmd || '')
+          : JSON.stringify(args).slice(0, 800);
+      setAgentTrace(prev => [
+        ...prev,
+        {
+          id: generateId(),
+          ts: Date.now(),
+          kind: 'tool_call',
+          callId,
+          name,
+          detail: detail || undefined,
+        },
+      ]);
+      if (name === 'run_shell') {
+        const command = String(args.command || args.cmd || '');
+        setTerminalRuns(prev => [...prev, { id: callId, command, status: 'running' }]);
+      }
+      return;
+    }
+
+    if (type === 'tool_result') {
+      const callId = String(event.id || '');
+      const name = String(event.name || '').trim();
+      const ok = Boolean((event as { ok?: boolean }).ok);
       const data = ((event.data ?? {}) as Record<string, unknown>) || {};
-      const status = String(data.status || 'fail') === 'success' ? 'success' : 'fail';
-      setTerminalRuns(prev =>
-        prev.map(run =>
-          run.id === id
-            ? {
-                ...run,
-                status,
-                cwd: typeof data.cwd === 'string' ? data.cwd : run.cwd,
-                stdout: typeof data.stdout === 'string' ? data.stdout : '',
-                stderr: typeof data.stderr === 'string' ? data.stderr : '',
-                exitCode: typeof data.exit_code === 'number' ? data.exit_code : undefined,
-              }
-            : run
-        )
-      );
+      const preview = JSON.stringify(data).slice(0, 1200);
+      setAgentTrace(prev => [
+        ...prev,
+        {
+          id: generateId(),
+          ts: Date.now(),
+          kind: 'tool_result',
+          callId,
+          name,
+          ok,
+          detail: preview,
+        },
+      ]);
+      if (name === 'run_shell') {
+        const status = String(data.status || 'fail') === 'success' ? 'success' : 'fail';
+        setTerminalRuns(prev =>
+          prev.map(run =>
+            run.id === callId
+              ? {
+                  ...run,
+                  status,
+                  cwd: typeof data.cwd === 'string' ? data.cwd : run.cwd,
+                  stdout: typeof data.stdout === 'string' ? data.stdout : '',
+                  stderr: typeof data.stderr === 'string' ? data.stderr : '',
+                  exitCode: typeof data.exit_code === 'number' ? data.exit_code : undefined,
+                }
+              : run
+          )
+        );
+      }
       return;
     }
 
@@ -229,7 +607,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
     if (type === 'media') {
       const kind = String(event.kind || 'screenshot');
-      const sid = agentSessionId || String(event.session_id || '');
+      const sid = String(event.session_id || '') || agentSessionIdRef.current || '';
       const artifactId = String(event.artifact_id || '');
       if (!artifactId || !sid) return;
 
@@ -247,7 +625,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         const video = (event.video ?? null) as Record<string, unknown> | null;
         if (video && typeof video.artifact_id === 'string') {
           const videoArtifactId = video.artifact_id;
-          const videoMimeType = typeof video.mime_type === 'string' ? video.mime_type : 'video/webm';
+          const videoMimeType =
+            typeof video.mime_type === 'string' ? video.mime_type : 'video/webm';
           const videoSrc = `/api/agent/capture/${encodeURIComponent(sid)}/${encodeURIComponent(videoArtifactId)}`;
           setMediaArtifacts(prev => [
             ...prev,
@@ -266,12 +645,9 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
     if (type === 'summary') {
       const report = (event.report ?? null) as SummaryReport | null;
-      if (report) {
-        setSummaryReport(report);
-      }
-      return;
+      if (report) setSummaryReport(report);
     }
-  }, [agentSessionId]);
+  }, []);
 
   const sendAgentChatToBackend = useCallback(
     async (userText: string, attachments?: Attachment[]) => {
@@ -293,12 +669,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
       const history = [...priorMessages, { role: 'user' as const, content: augmented }];
 
-      addMessage(userText, 'user', attachments, { chatId: cid });
+      addMessage(userText, 'user', attachments, cid);
       setIsAgentRunning(true);
       setTerminalRuns([]);
       setDiffProposals([]);
       setMediaArtifacts([]);
       setSummaryReport(null);
+      setAgentTrace([]);
 
       const body = {
         prompt: userText,
@@ -318,13 +695,15 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           body: JSON.stringify(body),
         });
         if (!res.ok || !res.body) {
-          addMessage(OFFLINE_ASSISTANT_MESSAGE, 'assistant', undefined, { chatId: cid });
+          addMessage(OFFLINE_ASSISTANT_MESSAGE, 'assistant', undefined, cid);
           return;
         }
 
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
+        /** Let React paint between NDJSON rows (otherwise one batched update at end of loop). */
+        const yieldToUi = () => new Promise<void>(r => setTimeout(r, 0));
 
         while (true) {
           const { done, value } = await reader.read();
@@ -336,27 +715,42 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             const trimmed = line.trim();
             if (!trimmed) continue;
             try {
-              const event = JSON.parse(trimmed) as AgentEvent;
-              handleAgentEvent(event);
-              if (String(event.type || '') === 'final') {
-                finalText = String(event.text || '').trim();
+              const ev = JSON.parse(trimmed) as AgentEvent;
+              handleAgentEvent(ev);
+              if (String(ev.type || '') === 'final') {
+                finalText = String(ev.text || '').trim();
               }
+              await yieldToUi();
             } catch {
-              // ignore malformed lines
+              /* ignore */
             }
           }
         }
+        const tail = buffer.trim();
+        if (tail) {
+          try {
+            const ev = JSON.parse(tail) as AgentEvent;
+            handleAgentEvent(ev);
+            if (String(ev.type || '') === 'final') {
+              finalText = String(ev.text || '').trim();
+            }
+            await new Promise<void>(r => setTimeout(r, 0));
+          } catch {
+            /* ignore */
+          }
+        }
       } catch {
-        addMessage(OFFLINE_ASSISTANT_MESSAGE, 'assistant', undefined, { chatId: cid });
+        addMessage(OFFLINE_ASSISTANT_MESSAGE, 'assistant', undefined, cid);
         return;
       } finally {
         setIsAgentRunning(false);
       }
 
       if (!finalText) {
-        finalText = 'Agent loop completed. Review terminal output, diffs, and summary cards below.';
+        finalText =
+          'Agent loop completed. Review terminal output, diffs, and summary cards below.';
       }
-      addMessage(finalText, 'assistant', undefined, { chatId: cid });
+      addMessage(finalText, 'assistant', undefined, cid);
       await refreshWorkspaceTree();
     },
     [
@@ -369,13 +763,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       handleAgentEvent,
       refreshWorkspaceTree,
     ]
-  );
-
-  const sendChatToBackend = useCallback(
-    async (userText: string, attachments?: Attachment[]) => {
-      await sendAgentChatToBackend(userText, attachments);
-    },
-    [sendAgentChatToBackend]
   );
 
   const applyDiffProposals = useCallback(
@@ -398,24 +785,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     [agentSessionId, refreshWorkspaceTree]
   );
 
-  const signIn = useCallback(async (email: string, _password: string) => {
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    setUser({
-      id: generateId(),
-      name: email.split('@')[0],
-      email,
-    });
-    setShowAuthModal(false);
-  }, []);
-
-  const signOut = useCallback(() => {
-    setUser(null);
-  }, []);
-
-  const getCurrentChat = useCallback(() => {
-    return chats.find(c => c.id === currentChatId);
-  }, [chats, currentChatId]);
-
   return (
     <ChatContext.Provider
       value={{
@@ -426,18 +795,26 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         isAuthenticated: !!user,
         showAuthModal,
         setShowAuthModal,
+        storageHydrated,
+        deepResearchActive,
+        setDeepResearchActive,
         createNewChat,
         selectChat,
         deleteChat,
         addMessage,
-        sendChatToBackend,
-        sendAgentChatToBackend,
-        applyDiffProposals,
-        refreshWorkspaceTree,
+        updateMessageContent,
+        updateMessageFields,
+        appendResearchTrace,
         setCurrentModel,
         signIn,
         signOut,
         getCurrentChat,
+        exportChatsJsonl,
+        syncChatsFromBackend,
+        pushChatsToBackend,
+        sendAgentChatToBackend,
+        applyDiffProposals,
+        refreshWorkspaceTree,
         agentSessionId,
         workspaceSnapshot,
         terminalRuns,
@@ -445,6 +822,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         mediaArtifacts,
         summaryReport,
         isAgentRunning,
+        agentTrace,
       }}
     >
       {children}

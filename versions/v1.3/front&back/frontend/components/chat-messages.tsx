@@ -1,18 +1,25 @@
 'use client';
 
-import { useRef, useEffect } from 'react';
+import { useRef, useEffect, useLayoutEffect, useCallback, useState } from 'react';
 import { Bot, User, Copy, Check, FileText, FileCode, Image as ImageIcon } from 'lucide-react';
 import type { Attachment } from '@/lib/types';
-import { ScrollArea } from '@/components/ui/scroll-area';
 import { Button } from '@/components/ui/button';
 import { useChatContext } from '@/lib/chat-context';
 import { MathRenderer } from './math-renderer';
-import { cn } from '@/lib/utils';
-import { useState } from 'react';
+import { ResearchTracePanel } from './research-trace-panel';
 import { TerminalCard } from './terminal-card';
 import { DiffPreviewCard } from './diff-preview-card';
 import { SummaryReportCard } from './summary-report-card';
 import { MediaArtifacts } from './media-artifacts';
+import { AgentTracePanel } from './agent-trace-panel';
+import { cn } from '@/lib/utils';
+
+/** Space for fixed composer + disclaimer so last messages stay scrollable above it */
+const COMPOSER_SCROLL_PADDING =
+  'pb-[calc(14rem+env(safe-area-inset-bottom,0px))]';
+
+/** Pixels from bottom — if user is within this, we keep pinning to bottom on stream/resize */
+const STICKY_BOTTOM_PX = 120;
 
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return bytes + ' B';
@@ -82,6 +89,10 @@ function CopyButton({ content }: { content: string }) {
   );
 }
 
+function distanceFromBottom(el: HTMLElement) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight;
+}
+
 export function ChatMessages() {
   const {
     getCurrentChat,
@@ -91,38 +102,109 @@ export function ChatMessages() {
     summaryReport,
     applyDiffProposals,
     isAgentRunning,
+    agentTrace,
   } = useChatContext();
   const chat = getCurrentChat();
   const scrollRef = useRef<HTMLDivElement>(null);
+  const innerRef = useRef<HTMLDivElement>(null);
+  /** When true, stream + layout growth will follow the bottom; wheel up clears this via onScroll */
+  const stickToBottomRef = useRef(true);
+  const messageIdsRef = useRef<string>('');
+
+  const messageIds = chat?.messages.map(m => m.id).join('\0') ?? '';
+  const lastContentLen = chat?.messages.at(-1)?.content.length ?? 0;
+
+  const onScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    stickToBottomRef.current = distanceFromBottom(el) <= STICKY_BOTTOM_PX;
+  }, []);
+
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !chat?.messages.length) return;
+
+    const newThreadShape = messageIds !== messageIdsRef.current;
+    messageIdsRef.current = messageIds;
+
+    if (newThreadShape) {
+      stickToBottomRef.current = true;
+      el.scrollTop = el.scrollHeight;
+      return;
+    }
+
+    if (stickToBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [
+    messageIds,
+    lastContentLen,
+    chat?.messages.length,
+    terminalRuns.length,
+    diffProposals.length,
+    mediaArtifacts.length,
+    summaryReport,
+    agentTrace.length,
+  ]);
 
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [chat?.messages]);
+    const scrollEl = scrollRef.current;
+    const inner = innerRef.current;
+    if (!scrollEl || !inner) return;
+    const ro = new ResizeObserver(() => {
+      if (!stickToBottomRef.current) return;
+      scrollEl.scrollTop = scrollEl.scrollHeight;
+    });
+    ro.observe(inner);
+    return () => ro.disconnect();
+  }, [
+    chat?.messages?.length,
+    messageIds,
+    terminalRuns.length,
+    diffProposals.length,
+    mediaArtifacts.length,
+    summaryReport,
+    agentTrace.length,
+  ]);
 
-  if (!chat || (chat.messages?.length ?? 0) === 0) {
+  if (!chat || chat.messages.length === 0) {
     return (
-      <div className="flex-1 flex items-center justify-center">
-        <div className="text-center max-w-md px-4">
-          <div className="flex items-center justify-center w-16 h-16 mx-auto mb-6 rounded-2xl bg-accent/10">
-            <Bot className="w-8 h-8 text-accent" />
+      <div
+        className={cn(
+          'flex min-h-0 flex-1 flex-col overflow-y-scroll overscroll-contain px-4 touch-pan-y',
+          COMPOSER_SCROLL_PADDING
+        )}
+        onScroll={onScroll}
+      >
+        <div className="flex min-h-full flex-1 items-center justify-center py-8">
+          <div className="max-w-md px-4 text-center">
+            <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-2xl bg-accent/10">
+              <Bot className="h-8 w-8 text-accent" />
+            </div>
+            <h2 className="mb-2 text-2xl font-semibold text-foreground">
+              How can I help you today?
+            </h2>
+            <p className="text-muted-foreground">
+              Start a conversation with Imagination AI. Ask questions, get creative, or explore ideas
+              together.
+            </p>
           </div>
-          <h2 className="text-2xl font-semibold text-foreground mb-2">
-            How can I help you today?
-          </h2>
-          <p className="text-muted-foreground">
-            Start a conversation with Imagination AI. Ask questions, get creative, or explore ideas together.
-          </p>
         </div>
       </div>
     );
   }
 
   return (
-    <ScrollArea ref={scrollRef} className="flex-1 px-4">
-      <div className="max-w-3xl mx-auto py-8 space-y-6">
-        {(chat.messages ?? []).map((message) => (
+    <div
+      ref={scrollRef}
+      onScroll={onScroll}
+      className={cn(
+        'relative z-0 min-h-0 flex-1 overflow-y-scroll overflow-x-hidden overscroll-contain px-4 touch-pan-y [scrollbar-gutter:stable]',
+        COMPOSER_SCROLL_PADDING
+      )}
+    >
+      <div ref={innerRef} className="mx-auto max-w-3xl space-y-6 py-8">
+        {chat.messages.map((message) => (
           <div
             key={message.id}
             className={cn(
@@ -158,23 +240,39 @@ export function ChatMessages() {
                   'relative px-4 py-3 rounded-2xl',
                   message.role === 'user'
                     ? 'bg-accent text-accent-foreground rounded-tr-md'
-                    : 'bg-card border border-border rounded-tl-md'
+                    : 'bg-card border border-border/80 rounded-tl-md shadow-sm ring-1 ring-white/10'
                 )}
               >
                 {/* Attachments */}
                 {message.attachments && message.attachments.length > 0 && (
                   <div className="flex flex-wrap gap-2 mb-3">
-                    {message.attachments?.map((attachment) => (
+                    {message.attachments.map((attachment) => (
                       <AttachmentPreview key={attachment.id} attachment={attachment} />
                     ))}
                   </div>
                 )}
                 
                 {message.role === 'assistant' ? (
-                  <MathRenderer content={message.content} />
+                  message.content.trim() ? (
+                    <MathRenderer content={message.content} />
+                  ) : (
+                    <span
+                      className="inline-block h-4 w-px animate-pulse bg-muted-foreground/60 align-middle"
+                      aria-hidden
+                    />
+                  )
                 ) : (
                   message.content && <p className="whitespace-pre-wrap">{message.content}</p>
                 )}
+                {message.role === 'assistant' &&
+                  ((message.researchTrace?.length ?? 0) > 0 ||
+                    message.answerPhase === 'preliminary' ||
+                    message.answerPhase === 'final') ? (
+                  <ResearchTracePanel
+                    events={message.researchTrace ?? []}
+                    phase={message.answerPhase ?? 'idle'}
+                  />
+                ) : null}
               </div>
 
               {/* Actions */}
@@ -186,6 +284,15 @@ export function ChatMessages() {
             </div>
           </div>
         ))}
+
+        {(agentTrace.length > 0 || isAgentRunning) &&
+          (agentTrace.length > 0 ? (
+            <AgentTracePanel entries={agentTrace} />
+          ) : (
+            <div className="rounded-xl border border-dashed border-border/70 bg-muted/10 px-3 py-4 text-center text-xs text-muted-foreground">
+              Agent running… trace (thinking and tools) will appear here as events stream in.
+            </div>
+          ))}
 
         {terminalRuns.length > 0 && (
           <div className="space-y-3">
@@ -221,6 +328,6 @@ export function ChatMessages() {
 
         {summaryReport && <SummaryReportCard report={summaryReport} />}
       </div>
-    </ScrollArea>
+    </div>
   );
 }
