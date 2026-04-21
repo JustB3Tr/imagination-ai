@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import difflib
 import hashlib
@@ -47,6 +48,11 @@ Schema for write_file (content is REQUIRED — the full file text, not just a pa
 Schema for read_file:
 {"thought":"...","tool_call":{"name":"read_file","args":{"path":"snake_game.py"}}}
 
+Schema for run_shell — use EITHER args.command as ONE shell string OR args.argv as a JSON array of tokens (preferred for python -c):
+{"thought":"...","tool_call":{"name":"run_shell","args":{"argv":["python3","-c","print(42)"]}}}
+{"thought":"...","tool_call":{"name":"run_shell","args":{"command":"python3 -c \"print(42)\""}}}
+Do not pass argv elements joined with commas inside a single string (that breaks parsing).
+
 When done:
 {"thought":"...","final_answer":"what was done and what to do next","summary_report":{"files_modified":[{"path":"...","why":"..."}],"commands_run":[],"captures":[]}}
 
@@ -55,6 +61,58 @@ Never describe game scores, movement, or UI behavior that you did not actually i
 
 If the model uses chain-of-thought, end the message with the JSON object as the last characters.
 """
+
+
+def _normalize_tool_name(raw: str) -> str:
+    """Map common model variants (runShell, run Shell) to canonical snake_case tool ids."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s)
+    return s.lower()
+
+
+def _coerce_shell_argv(args: Dict[str, Any]) -> Tuple[Optional[List[str]], str, Optional[str]]:
+    """Build argv for subprocess.run(..., shell=False). Returns (argv, display, error)."""
+    posix = os.name != "nt"
+
+    if "argv" in args and isinstance(args["argv"], (list, tuple)):
+        argv = [str(x) for x in args["argv"] if str(x).strip()]
+        if not argv:
+            return None, "", "run_shell args.argv must be a non-empty JSON array of strings"
+        display = " ".join(shlex.quote(a) for a in argv) if posix else subprocess.list2cmdline(argv)
+        return argv, display, None
+
+    raw_cmd = args.get("command") or args.get("cmd")
+    if isinstance(raw_cmd, dict):
+        return None, "", "run_shell args.command must be a string or JSON array, not an object"
+    if isinstance(raw_cmd, (list, tuple)):
+        argv = [str(x) for x in raw_cmd if str(x).strip()]
+        if not argv:
+            return None, "", "run_shell args.command as array must be non-empty"
+        display = " ".join(shlex.quote(a) for a in argv) if posix else subprocess.list2cmdline(argv)
+        return argv, display, None
+
+    command = str(raw_cmd or "").strip()
+    if not command:
+        return None, "", "command is required (string or argv array)"
+
+    if command.startswith("[") and command.rstrip().endswith("]"):
+        try:
+            loaded = ast.literal_eval(command)
+        except (SyntaxError, ValueError, TypeError):
+            loaded = None
+        if isinstance(loaded, (list, tuple)):
+            return _coerce_shell_argv({"argv": [str(x) for x in loaded]})
+
+    try:
+        argv = shlex.split(command, posix=posix)
+    except ValueError:
+        argv = [command]
+    if not argv:
+        return None, "", "command is empty after parsing"
+    return argv, command, None
 
 
 @dataclass
@@ -400,7 +458,7 @@ class AgenticLoop:
                     break
                 continue
 
-            tool_name = str(tool_call.get("name") or "").strip()
+            tool_name = _normalize_tool_name(str(tool_call.get("name") or ""))
             args = tool_call.get("args") if isinstance(tool_call.get("args"), dict) else {}
 
             if not tool_name:
@@ -565,9 +623,10 @@ class AgenticLoop:
         if not allow_shell:
             return False, {"error": "run_shell disabled by IMAGINATION_AGENT_ALLOW_SHELL=0"}
 
-        command = str(args.get("command") or args.get("cmd") or "").strip()
-        if not command:
-            return False, {"error": "command is required"}
+        argv, command_display, argv_err = _coerce_shell_argv(args)
+        if argv_err or not argv:
+            return False, {"error": argv_err or "command is required"}
+
         cwd_raw = str(args.get("cwd") or "").strip()
         timeout_ms = int(args.get("timeout_ms") or 90_000)
         timeout_sec = max(1, min(600, timeout_ms // 1000))
@@ -578,12 +637,7 @@ class AgenticLoop:
         else:
             cwd = str(self.workspace)
 
-        try:
-            argv = shlex.split(command, posix=os.name != "nt")
-        except Exception:
-            argv = [command]
-
-        self.state.commands_run.append(command)
+        self.state.commands_run.append(command_display)
         completed = subprocess.run(
             argv,
             cwd=cwd,
@@ -596,7 +650,7 @@ class AgenticLoop:
         stderr = (completed.stderr or "")[:10000]
         ok = completed.returncode == 0
         return ok, {
-            "command": command,
+            "command": command_display,
             "cwd": cwd,
             "exit_code": completed.returncode,
             "stdout": stdout,
