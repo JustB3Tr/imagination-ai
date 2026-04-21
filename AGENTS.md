@@ -1,5 +1,26 @@
 # AGENTS.md
 
+## Agent workflow (read this when changing v1.3 or v0-imagination-ui)
+
+**When this file is read:** Cursor may attach it as a requestable workspace rule; agents should **open and follow this section** whenever they edit **`versions/v1.3/`** (backend), **`v0-imagination-ui/`** (Next frontend), or the **embedded** frontend under **`versions/v1.3/front&back/frontend/`**. It is not guaranteed to load on every unrelated turn.
+
+### Versioning (v1.3 line)
+
+- **Bug fixes and small iterative changes** on the current v1.3 stack: treat them as **patch releases** — **`v1.3.1`**, **`v1.3.2`**, … (semver patch). After each such change set, **bump and record** the patch (e.g. maintain `versions/v1.3/VERSION` with `1.3.N`, and/or **git tag** `v1.3.N` on `imagination-ai` when you push). Do not use `1.4`/`1.5` folders for routine fixes.
+- **Large / era-sized updates** (new capabilities, breaking layout, new training stack): use **new minor lines** — new top-level dirs such as **`versions/v1.4/`**, **`versions/v1.5/`**, as the project already does for `v1.1.2`, `v1.2.1`, `v1.3`.
+
+Physical **snapshot copies** like `versions/v1.3.1/` as a full tree are **optional** and only if you need a frozen parallel tree; default is **one live `versions/v1.3/`** plus **tags / VERSION** for patches.
+
+### Pushes and frontend testing (required after changes)
+
+1. **Backend changes** (Python/runtime, `api_server.py`, `imagination_runtime` under `versions/v1.3/`, requirements, Colab scripts, **this `AGENTS.md`**, etc.): **commit and push to `imagination-ai`** (this monorepo’s `origin`).
+2. **Frontend changes** (anything in **`v0-imagination-ui/`** or the Next app under **`versions/v1.3/front&back/frontend/`**):
+   - **Work against a local clone:** use **`C:\dev\v0-imagination-ui`** (clone from `https://github.com/JustB3Tr/v0-imagination-ui` if missing; `git pull` before editing or mirror changes there). Run **`npm install`** / **`npx next build`** (or `npm run dev`) on **C:** — **not** on `G:\My Drive\...` (Google Drive breaks npm often).
+   - **Push the frontend repo:** **commit and push to `v0-imagination-ui`** on GitHub.
+   - If the monorepo **submodule** `v0-imagination-ui` should track that commit, **bump the submodule pointer** in `imagination-ai` and push the monorepo too.
+
+---
+
 ## Cursor Cloud specific instructions
 
 This is a Python/Gradio AI application ("Imagination v1.1.2"). The primary runnable code lives in `versions/v1.1.2/`.
