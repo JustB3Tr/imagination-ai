@@ -16,6 +16,58 @@ export interface Message {
   createdAt: Date;
 }
 
+export interface WorkspaceTreeNode {
+  name: string;
+  path: string;
+  type: 'file' | 'dir';
+  size?: number;
+  truncated?: boolean;
+  children?: WorkspaceTreeNode[];
+}
+
+export interface WorkspaceSnapshot {
+  root: string;
+  session_id: string;
+  tree: WorkspaceTreeNode | null;
+  truncated?: boolean;
+}
+
+export type TerminalStatus = 'running' | 'success' | 'fail';
+
+export interface TerminalRun {
+  id: string;
+  command: string;
+  cwd?: string;
+  stdout?: string;
+  stderr?: string;
+  exitCode?: number;
+  status: TerminalStatus;
+}
+
+export interface DiffProposal {
+  proposalId: string;
+  path: string;
+  diff: string;
+  applied: boolean;
+}
+
+export interface SummaryReport {
+  session_id: string;
+  workspace_root: string;
+  files_modified: Array<{ path: string; why: string }>;
+  commands_run: string[];
+  captures: Array<{ artifact_id: string; kind: string; path: string }>;
+  pending_proposals: Array<{ proposal_id: string; path: string; reason: string }>;
+}
+
+export interface MediaArtifact {
+  artifactId: string;
+  sessionId: string;
+  kind: 'screenshot' | 'video';
+  mimeType: string;
+  src: string;
+}
+
 export interface Chat {
   id: string;
   title: string;

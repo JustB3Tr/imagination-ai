@@ -9,6 +9,10 @@ import { useChatContext } from '@/lib/chat-context';
 import { MathRenderer } from './math-renderer';
 import { cn } from '@/lib/utils';
 import { useState } from 'react';
+import { TerminalCard } from './terminal-card';
+import { DiffPreviewCard } from './diff-preview-card';
+import { SummaryReportCard } from './summary-report-card';
+import { MediaArtifacts } from './media-artifacts';
 
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return bytes + ' B';
@@ -79,7 +83,15 @@ function CopyButton({ content }: { content: string }) {
 }
 
 export function ChatMessages() {
-  const { getCurrentChat } = useChatContext();
+  const {
+    getCurrentChat,
+    terminalRuns,
+    diffProposals,
+    mediaArtifacts,
+    summaryReport,
+    applyDiffProposals,
+    isAgentRunning,
+  } = useChatContext();
   const chat = getCurrentChat();
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -174,6 +186,40 @@ export function ChatMessages() {
             </div>
           </div>
         ))}
+
+        {terminalRuns.length > 0 && (
+          <div className="space-y-3">
+            <p className="text-xs uppercase tracking-wide text-muted-foreground">Terminal</p>
+            {terminalRuns.map(run => (
+              <TerminalCard key={run.id} run={run} />
+            ))}
+          </div>
+        )}
+
+        {diffProposals.length > 0 && (
+          <div className="space-y-3">
+            <p className="text-xs uppercase tracking-wide text-muted-foreground">Diff Preview</p>
+            {diffProposals.map(proposal => (
+              <DiffPreviewCard
+                key={proposal.proposalId}
+                proposal={proposal}
+                onApply={(proposalId) => {
+                  void applyDiffProposals([proposalId]);
+                }}
+                disabled={isAgentRunning}
+              />
+            ))}
+          </div>
+        )}
+
+        {mediaArtifacts.length > 0 && (
+          <div>
+            <p className="mb-2 text-xs uppercase tracking-wide text-muted-foreground">Screen Capture</p>
+            <MediaArtifacts items={mediaArtifacts} />
+          </div>
+        )}
+
+        {summaryReport && <SummaryReportCard report={summaryReport} />}
       </div>
     </ScrollArea>
   );

@@ -13,6 +13,8 @@ import uuid
 from multiprocessing import Pool
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from imagination_runtime.http_chat_system import enrich_messages_with_imagination_system
+from imagination_runtime.internal_prompt import load_identity_first_block
 from imagination_runtime.paths import resolve_root_path
 from imagination_runtime.web import get_domain, web_search
 
@@ -178,7 +180,7 @@ def run_deep_ndjson(body: Any) -> Iterator[bytes]:
     from imagination_runtime.chat_http import _generate_native, _stream_native
     from imagination_v1_3 import _effective_main_max_new_tokens
 
-    base_msgs = _messages_for_deep(body)
+    base_msgs = enrich_messages_with_imagination_system(_messages_for_deep(body))
     user_question = (body.prompt or "").strip() or (
         base_msgs[-1]["content"] if base_msgs else ""
     )
@@ -429,8 +431,10 @@ def run_deep_ndjson(body: Any) -> Iterator[bytes]:
         "Cite sources by URL when possible."
     )
     final_user = f"Question:\n{user_question}\n\nRetrieved context:\n{ctx_block[:12000]}\n\nVerification:\n{verify_out[:2000]}"
-    tail_hist = base_msgs[-6:] if len(base_msgs) > 6 else base_msgs
-    final_msgs = [{"role": "system", "content": final_sys}, *tail_hist, {"role": "user", "content": final_user}]
+    hist_only = [m for m in base_msgs if m.get("role") in ("user", "assistant")]
+    tail_hist = hist_only[-6:] if len(hist_only) > 6 else hist_only
+    combined_sys = (load_identity_first_block(root) + "\n\n" + final_sys).strip()
+    final_msgs = [{"role": "system", "content": combined_sys}, *tail_hist, {"role": "user", "content": final_user}]
 
     try:
         for text in _stream_native(final_msgs, max_nt):

@@ -56,9 +56,47 @@ function renderMath(katex: KaTeXModule, latex: string, displayMode: boolean): st
   }
 }
 
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 // Parse and render content with math
 function processContent(katex: KaTeXModule, text: string): string {
   let result = text;
+
+  // Terminal fences: ```terminal ... ```
+  result = result.replace(/```terminal\s*\n([\s\S]*?)```/g, (_, block) => {
+    const body = String(block || '').trim();
+    const lines = body.split('\n');
+    let status = 'Running';
+    let statusClass = 'text-amber-300 border-amber-300/40 bg-amber-400/10';
+    const first = (lines[0] || '').trim().toLowerCase();
+    if (first.startsWith('status:')) {
+      const raw = first.replace('status:', '').trim();
+      if (raw.includes('success')) {
+        status = 'Success';
+        statusClass = 'text-emerald-300 border-emerald-300/40 bg-emerald-400/10';
+      } else if (raw.includes('fail')) {
+        status = 'Fail';
+        statusClass = 'text-red-300 border-red-300/40 bg-red-400/10';
+      }
+      lines.shift();
+    }
+    const payload = escapeHtml(lines.join('\n'));
+    return `<div class="my-3 rounded-xl border border-border bg-card p-3">
+      <div class="mb-2">
+        <span class="inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${statusClass}">
+          ${status}
+        </span>
+      </div>
+      <pre class="whitespace-pre-wrap break-words rounded-md bg-black/70 p-2 text-xs text-zinc-100">${payload}</pre>
+    </div>`;
+  });
   
   // First, handle display math ($$...$$) - these should be on their own line
   result = result.replace(/\$\$([\s\S]*?)\$\$/g, (_, math) => {

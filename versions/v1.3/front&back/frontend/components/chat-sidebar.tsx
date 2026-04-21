@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { useChatContext } from '@/lib/chat-context';
 import { cn } from '@/lib/utils';
+import { FileTree } from '@/components/file-tree';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -24,6 +25,8 @@ export function ChatSidebar() {
     isAuthenticated,
     setShowAuthModal,
     signOut,
+    workspaceSnapshot,
+    refreshWorkspaceTree,
   } = useChatContext();
 
   return (
@@ -73,6 +76,25 @@ export function ChatSidebar() {
               </button>
             </div>
           ))}
+        </div>
+
+        <div className="mt-4 rounded-lg border border-sidebar-border/70 bg-sidebar-accent/20 p-2">
+          <div className="mb-2 flex items-center justify-between">
+            <span className="text-[11px] uppercase tracking-wide text-muted-foreground">
+              Workspace
+            </span>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 px-2 text-[11px]"
+              onClick={() => {
+                void refreshWorkspaceTree();
+              }}
+            >
+              Refresh
+            </Button>
+          </div>
+          <FileTree root={workspaceSnapshot?.tree ?? null} />
         </div>
       </ScrollArea>
 

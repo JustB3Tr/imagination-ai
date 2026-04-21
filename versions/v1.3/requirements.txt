@@ -11,6 +11,7 @@ trafilatura
 chromadb
 sentence-transformers
 ddgs
+playwright
 diffusers
 bcrypt
 fastapi>=0.100

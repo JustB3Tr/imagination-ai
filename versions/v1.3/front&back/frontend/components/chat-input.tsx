@@ -54,7 +54,7 @@ export function ChatInput() {
   const [isLoading, setIsLoading] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const { sendChatToBackend } = useChatContext();
+  const { sendChatToBackend, isAgentRunning } = useChatContext();
 
   useEffect(() => {
     if (textareaRef.current) {
@@ -123,7 +123,7 @@ export function ChatInput() {
   };
 
   const handleSubmit = async () => {
-    if ((!input.trim() && attachments.length === 0) || isLoading) return;
+    if ((!input.trim() && attachments.length === 0) || isLoading || isAgentRunning) return;
 
     const userMessage = input.trim();
     const currentAttachments = [...attachments];
@@ -241,7 +241,7 @@ export function ChatInput() {
 
             <Button
               onClick={handleSubmit}
-              disabled={(!input.trim() && attachments.length === 0) || isLoading}
+              disabled={(!input.trim() && attachments.length === 0) || isLoading || isAgentRunning}
               size="icon"
               className="bg-accent text-accent-foreground hover:bg-accent/90 disabled:opacity-50"
               aria-label="Send message"
@@ -252,7 +252,9 @@ export function ChatInput() {
         </div>
 
         <p className="text-center text-xs text-muted-foreground mt-3">
-          Imagination AI can make mistakes. Consider checking important information.
+          {isAgentRunning
+            ? 'Agent loop running: review terminal and diff cards as events stream in.'
+            : 'Imagination AI can make mistakes. Consider checking important information.'}
         </p>
       </div>
     </div>
