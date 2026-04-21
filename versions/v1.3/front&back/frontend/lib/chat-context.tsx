@@ -527,6 +527,22 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       return;
     }
 
+    if (type === 'final') {
+      const t = String((event as { text?: string }).text || '').trim();
+      setAgentTrace(prev => [
+        ...prev,
+        {
+          id: generateId(),
+          ts: Date.now(),
+          kind: 'final',
+          text:
+            t ||
+            'Agent loop completed. Review terminal output, diffs, and summary cards below.',
+        },
+      ]);
+      return;
+    }
+
     if (type === 'tool_call') {
       const callId = String(event.id || generateId());
       const name = String(event.name || '').trim();
@@ -687,7 +703,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         allow_network_tools: true,
       };
 
-      let finalText = '';
       try {
         const res = await fetch('/api/chat/agent', {
           method: 'POST',
@@ -717,9 +732,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             try {
               const ev = JSON.parse(trimmed) as AgentEvent;
               handleAgentEvent(ev);
-              if (String(ev.type || '') === 'final') {
-                finalText = String(ev.text || '').trim();
-              }
               await yieldToUi();
             } catch {
               /* ignore */
@@ -731,9 +743,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           try {
             const ev = JSON.parse(tail) as AgentEvent;
             handleAgentEvent(ev);
-            if (String(ev.type || '') === 'final') {
-              finalText = String(ev.text || '').trim();
-            }
             await new Promise<void>(r => setTimeout(r, 0));
           } catch {
             /* ignore */
@@ -746,11 +755,19 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         setIsAgentRunning(false);
       }
 
-      if (!finalText) {
-        finalText =
-          'Agent loop completed. Review terminal output, diffs, and summary cards below.';
-      }
-      addMessage(finalText, 'assistant', undefined, cid);
+      setAgentTrace(prev => {
+        if (prev.some(e => e.kind === 'final')) return prev;
+        return [
+          ...prev,
+          {
+            id: generateId(),
+            ts: Date.now(),
+            kind: 'final',
+            text:
+              'Agent loop completed. Review terminal output, diffs, and summary cards below.',
+          },
+        ];
+      });
       await refreshWorkspaceTree();
     },
     [

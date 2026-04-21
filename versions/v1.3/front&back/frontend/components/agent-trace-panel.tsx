@@ -2,11 +2,12 @@
 
 import type { AgentTraceEntry } from '@/lib/types';
 import { cn } from '@/lib/utils';
-import { Cpu, AlertCircle, Wrench, CheckCircle2, XCircle } from 'lucide-react';
+import { Cpu, AlertCircle, Wrench, CheckCircle2, XCircle, MessageSquareText } from 'lucide-react';
 
 function KindIcon({ kind, ok }: { kind: AgentTraceEntry['kind']; ok?: boolean }) {
   if (kind === 'thought') return <Cpu className="h-3.5 w-3.5 shrink-0 text-accent" aria-hidden />;
   if (kind === 'error') return <AlertCircle className="h-3.5 w-3.5 shrink-0 text-destructive" aria-hidden />;
+  if (kind === 'final') return <MessageSquareText className="h-3.5 w-3.5 shrink-0 text-primary" aria-hidden />;
   if (kind === 'tool_call') return <Wrench className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />;
   if (ok) return <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-500" aria-hidden />;
   return <XCircle className="h-3.5 w-3.5 shrink-0 text-amber-500" aria-hidden />;
@@ -26,7 +27,8 @@ export function AgentTracePanel({ entries }: { entries: AgentTraceEntry[] }) {
             key={e.id}
             className={cn(
               'rounded-lg border border-border/50 bg-card/90 px-2.5 py-2 text-xs leading-relaxed',
-              e.kind === 'error' && 'border-destructive/40 bg-destructive/5'
+              e.kind === 'error' && 'border-destructive/40 bg-destructive/5',
+              e.kind === 'final' && 'border-primary/35 bg-primary/5'
             )}
           >
             <div className="flex items-start gap-2">
@@ -38,9 +40,11 @@ export function AgentTracePanel({ entries }: { entries: AgentTraceEntry[] }) {
                       ? 'Thinking'
                       : e.kind === 'error'
                         ? 'Error'
-                        : e.kind === 'tool_call'
-                          ? `Tool · ${e.name || '?'}`
-                          : `Result · ${e.name || '?'}`}
+                        : e.kind === 'final'
+                          ? 'Final answer'
+                          : e.kind === 'tool_call'
+                            ? `Tool · ${e.name || '?'}`
+                            : `Result · ${e.name || '?'}`}
                   </span>
                   {e.callId ? (
                     <span className="font-mono text-[10px] opacity-70" title={e.callId}>

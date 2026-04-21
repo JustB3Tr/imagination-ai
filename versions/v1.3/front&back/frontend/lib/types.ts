@@ -101,7 +101,7 @@ export interface MediaArtifact {
 export interface AgentTraceEntry {
   id: string;
   ts: number;
-  kind: 'thought' | 'tool_call' | 'tool_result' | 'error';
+  kind: 'thought' | 'tool_call' | 'tool_result' | 'error' | 'final';
   name?: string;
   text?: string;
   callId?: string;
