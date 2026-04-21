@@ -452,6 +452,17 @@ class AgenticLoop:
                 }
             )
 
+            if tool_name == "write_file" and not ok:
+                convo.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "write_file was rejected: include the full file source in args.content "
+                            r'(a string; use JSON escapes like \n for newlines). Then call write_file again.'
+                        ),
+                    }
+                )
+
             if tool_name == "run_shell" and not ok:
                 convo.append(
                     {
