@@ -104,6 +104,7 @@ export function ChatMessages() {
     isAgentRunning,
     agentTrace,
     workspaceSnapshot,
+    writeFileStream,
   } = useChatContext();
   const chat = getCurrentChat();
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -146,6 +147,8 @@ export function ChatMessages() {
     mediaArtifacts.length,
     summaryReport,
     agentTrace.length,
+    writeFileStream?.revealed,
+    writeFileStream?.fullText,
   ]);
 
   useEffect(() => {
@@ -166,6 +169,8 @@ export function ChatMessages() {
     mediaArtifacts.length,
     summaryReport,
     agentTrace.length,
+    writeFileStream?.revealed,
+    writeFileStream?.fullText,
   ]);
 
   if (!chat || chat.messages.length === 0) {
@@ -300,14 +305,13 @@ export function ChatMessages() {
           </div>
         ) : null}
 
-        {(agentTrace.length > 0 || isAgentRunning) &&
-          (agentTrace.length > 0 ? (
-            <AgentTracePanel entries={agentTrace} />
-          ) : (
-            <div className="rounded-xl border border-dashed border-border/70 bg-muted/10 px-3 py-4 text-center text-xs text-muted-foreground">
-              Agent running… trace (thinking and tools) will appear here as events stream in.
-            </div>
-          ))}
+        {(agentTrace.length > 0 || isAgentRunning || writeFileStream) ? (
+          <AgentTracePanel
+            entries={agentTrace}
+            scriptPreview={writeFileStream}
+            isAgentRunning={isAgentRunning}
+          />
+        ) : null}
 
         {terminalRuns.length > 0 && (
           <div className="space-y-3">

@@ -10,6 +10,7 @@ import {
   useRef,
   type ReactNode,
 } from 'react';
+import { flushSync } from 'react-dom';
 import { useSession, signIn as nextAuthSignIn, signOut as nextAuthSignOut } from 'next-auth/react';
 import type {
   AgentChatMemory,
@@ -25,6 +26,7 @@ import type {
   TerminalRun,
   User,
   WorkspaceSnapshot,
+  WriteFileStreamState,
 } from './types';
 import { deriveChatTitle } from './chat-title';
 import {
@@ -88,6 +90,8 @@ interface ChatContextType {
   summaryReport: SummaryReport | null;
   isAgentRunning: boolean;
   agentTrace: AgentTraceEntry[];
+  /** Live typewriter preview while a write_file tool call is in progress */
+  writeFileStream: WriteFileStreamState | null;
 }
 
 const ChatContext = createContext<ChatContextType | undefined>(undefined);
@@ -228,6 +232,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const [summaryReport, setSummaryReport] = useState<SummaryReport | null>(null);
   const [isAgentRunning, setIsAgentRunning] = useState(false);
   const [agentTrace, setAgentTrace] = useState<AgentTraceEntry[]>([]);
+  const [writeFileStream, setWriteFileStream] = useState<WriteFileStreamState | null>(null);
   const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const currentChatIdRef = useRef<string | null>(null);
   const latestRef = useRef({
@@ -241,6 +246,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     terminalRuns,
     mediaArtifacts,
     summaryReport,
+    writeFileStream: null as WriteFileStreamState | null,
   });
   currentChatIdRef.current = currentChatId;
   latestRef.current = {
@@ -254,6 +260,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     terminalRuns,
     mediaArtifacts,
     summaryReport,
+    writeFileStream,
   };
 
   useEffect(() => {
@@ -383,7 +390,25 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     setTerminalRuns(m?.terminalRuns ?? []);
     setMediaArtifacts(m?.mediaArtifacts ?? []);
     setSummaryReport(m?.summaryReport ?? null);
+    setWriteFileStream(null);
   }, []);
+
+  useEffect(() => {
+    if (!writeFileStream || writeFileStream.complete) return;
+    const fullLen = writeFileStream.fullText.length;
+    if (writeFileStream.revealed >= fullLen) {
+      setWriteFileStream(s => (s ? { ...s, complete: true } : null));
+      return;
+    }
+    const id = window.setTimeout(() => {
+      setWriteFileStream(s => {
+        if (!s || s.complete) return s;
+        const step = Math.min(6, s.fullText.length - s.revealed);
+        return { ...s, revealed: s.revealed + step };
+      });
+    }, 18);
+    return () => clearTimeout(id);
+  }, [writeFileStream]);
 
   useLayoutEffect(() => {
     if (!storageHydrated) return;
@@ -788,7 +813,9 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       const detail =
         name === 'run_shell'
           ? String(args.command || args.cmd || '')
-          : JSON.stringify(args).slice(0, 800);
+          : name === 'write_file' || name === 'read_file'
+            ? String(args.path || '')
+            : JSON.stringify(args).slice(0, 800);
       setAgentTrace(prev => [
         ...prev,
         {
@@ -800,6 +827,18 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           detail: detail || undefined,
         },
       ]);
+      if (name === 'write_file') {
+        const path = String(args.path || 'untitled');
+        const fullText =
+          typeof args.content === 'string' ? args.content : String(args.content ?? '');
+        setWriteFileStream({
+          callId,
+          path,
+          fullText,
+          revealed: 0,
+          complete: fullText.length === 0,
+        });
+      }
       if (name === 'run_shell') {
         const command = String(args.command || args.cmd || '');
         setTerminalRuns(prev => [...prev, { id: callId, command, status: 'running' }]);
@@ -825,6 +864,12 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           detail: preview,
         },
       ]);
+      if (name === 'write_file') {
+        setWriteFileStream(s => {
+          if (!s || s.callId !== callId) return s;
+          return { ...s, revealed: s.fullText.length, complete: true };
+        });
+      }
       if (name === 'run_shell') {
         const status = String(data.status || 'fail') === 'success' ? 'success' : 'fail';
         setTerminalRuns(prev =>
@@ -930,6 +975,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       setMediaArtifacts([]);
       setSummaryReport(null);
       setAgentTrace([]);
+      setWriteFileStream(null);
 
       const body = {
         prompt: userText,
@@ -969,7 +1015,9 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             if (!trimmed) continue;
             try {
               const ev = JSON.parse(trimmed) as AgentEvent;
-              handleAgentEvent(ev);
+              flushSync(() => {
+                handleAgentEvent(ev);
+              });
               await yieldToUi();
             } catch {
               /* ignore */
@@ -980,7 +1028,9 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         if (tail) {
           try {
             const ev = JSON.parse(tail) as AgentEvent;
-            handleAgentEvent(ev);
+            flushSync(() => {
+              handleAgentEvent(ev);
+            });
             await new Promise<void>(r => setTimeout(r, 0));
           } catch {
             /* ignore */
@@ -1078,6 +1128,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         summaryReport,
         isAgentRunning,
         agentTrace,
+        writeFileStream,
       }}
     >
       {children}

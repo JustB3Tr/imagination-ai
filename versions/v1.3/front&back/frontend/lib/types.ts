@@ -101,6 +101,15 @@ export interface AgentTraceEntry {
   ok?: boolean;
 }
 
+/** Live typewriter preview for a write_file tool call (UI only). */
+export interface WriteFileStreamState {
+  callId: string;
+  path: string;
+  fullText: string;
+  revealed: number;
+  complete: boolean;
+}
+
 /** Persisted Composer session (trace, workspace, diffs) so refresh / chat switch can restore UI. */
 export interface AgentChatMemory {
   sessionId?: string;
