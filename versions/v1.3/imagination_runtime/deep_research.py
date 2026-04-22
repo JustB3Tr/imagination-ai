@@ -460,10 +460,13 @@ def attach_deep_and_sync_routes(app: Any) -> None:
 
     from imagination_runtime.chat_http import ChatApiRequest, coerce_chat_api_request_dict
 
+    # Use ``http_request`` not ``request``: FastAPI/Starlette can treat ``request`` as a *query* param
+    # and return 422 Field required (loc: query, request) before the route body runs. Same pattern as
+    # ``asgi_app.py`` auth routes.
     @app.post("/api/chat/deep")
-    async def api_chat_deep(request: Request) -> StreamingResponse:
+    async def api_chat_deep(http_request: Request) -> StreamingResponse:
         try:
-            raw: Any = await request.json()
+            raw: Any = await http_request.json()
         except Exception:
             raise HTTPException(status_code=400, detail="invalid_json")
         if not isinstance(raw, dict):
@@ -525,12 +528,12 @@ def attach_deep_and_sync_routes(app: Any) -> None:
 
     @app.post("/api/sync/chats")
     async def sync_chats_post(
-        request: Request,
+        http_request: Request,
         x_imagination_user_id: Optional[str] = Header(None),
     ) -> Dict[str, str]:
         uid = (x_imagination_user_id or "").strip() or "anonymous"
         try:
-            payload = await request.json()
+            payload = await http_request.json()
         except Exception:
             raise HTTPException(status_code=400, detail="invalid_json")
 
