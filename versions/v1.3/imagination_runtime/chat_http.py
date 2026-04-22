@@ -64,6 +64,7 @@ class ChatApiRequest(BaseModel):
     currentModel: str = "imagination-1.3"
     messages: Optional[List[ChatMessage]] = None
     image: Optional[str] = None
+    attachments: Optional[List[Dict[str, Any]]] = None
     max_new_tokens: Optional[int] = None
 
 
@@ -137,6 +138,20 @@ def _inject_clip_image_placeholder(
     return out
 
 
+def _first_image_data_url_from_attachments(attachments: Optional[List[Dict[str, Any]]]) -> str:
+    if not attachments:
+        return ""
+    for att in attachments:
+        if not isinstance(att, dict):
+            continue
+        if str(att.get("type", "")).lower() != "image":
+            continue
+        url = att.get("url")
+        if isinstance(url, str) and url.strip().lower().startswith("data:image/"):
+            return url.strip()
+    return ""
+
+
 def _parse_image_data_url(image_data: str) -> Optional[Any]:
     """
     Parse a data URL (``data:image/...;base64,...``) into a PIL image.
@@ -146,23 +161,39 @@ def _parse_image_data_url(image_data: str) -> Optional[Any]:
     if not image_data:
         return None
     s = image_data.strip()
-    if not s.startswith("data:image/"):
+    if not s.lower().startswith("data:image/"):
         return None
     comma = s.find(",")
     if comma <= 0:
         return None
     meta = s[:comma].lower()
-    if ";base64" not in meta:
+    if "base64" not in meta:
         return None
-    b64 = s[comma + 1 :]
+    b64 = "".join(s[comma + 1 :].split())
     try:
         raw = base64.b64decode(b64, validate=False)
         from PIL import Image
 
-        img = Image.open(BytesIO(raw))
+        bio = BytesIO(raw)
+        img = Image.open(bio)
+        img.load()
         return img.convert("RGB")
-    except Exception:
+    except Exception as e:
+        print(f"[imagination] image decode failed ({type(e).__name__}): {e}", flush=True)
         return None
+
+
+def _resolve_chat_pil_image(body: ChatApiRequest) -> tuple[Optional[Any], str]:
+    """
+    Prefer ``body.image``, else first ``attachments[].url`` that looks like a data URL.
+    Returns ``(pil_or_none, raw_data_url_or_empty)``.
+    """
+    raw = (body.image or "").strip()
+    if not raw:
+        raw = _first_image_data_url_from_attachments(body.attachments)
+    if not raw:
+        return None, ""
+    return _parse_image_data_url(raw), raw
 
 
 def _stream_native(
@@ -257,7 +288,15 @@ def attach_generation_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=400, detail="Provide `prompt` and/or `messages`")
         default_max = _effective_main_max_new_tokens()
         max_nt = body.max_new_tokens if body.max_new_tokens is not None else default_max
-        pil_image = _parse_image_data_url(body.image or "")
+        pil_image, img_raw = _resolve_chat_pil_image(body)
+        if img_raw and pil_image is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Could not decode the image payload (WEBP/JPEG/PNG). "
+                    "Try PNG or JPEG, or upgrade Pillow with WEBP support on the server."
+                ),
+            )
         try:
             if _web_followups_active():
                 text = final_text_from_stream(
@@ -294,9 +333,28 @@ def attach_generation_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=400, detail="Provide `prompt` and/or `messages`")
         default_max = _effective_main_max_new_tokens()
         max_nt = body.max_new_tokens if body.max_new_tokens is not None else default_max
-        pil_image = _parse_image_data_url(body.image or "")
+        pil_image, img_raw = _resolve_chat_pil_image(body)
 
         def ndjson_chunks() -> Iterator[bytes]:
+            if img_raw and pil_image is None:
+                err = json.dumps(
+                    {
+                        "error": (
+                            "Could not decode the image payload (WEBP/JPEG/PNG). "
+                            "Try PNG or JPEG, or upgrade Pillow with WEBP support on the server."
+                        )
+                    },
+                    ensure_ascii=False,
+                ) + "\n"
+                yield err.encode("utf-8")
+                return
+
+            prelude = (
+                "_Vision: image decoded; generating… (first tokens can take 1–3 minutes on Colab)_\n\n"
+                if pil_image is not None
+                else "_Generating…_\n\n"
+            )
+            yield (json.dumps({"text": prelude}, ensure_ascii=False) + "\n").encode("utf-8")
             try:
                 if _web_followups_active():
                     stream_iter = iterate_display_text_with_web(
@@ -308,7 +366,7 @@ def attach_generation_routes(app: FastAPI) -> None:
                     stream_iter = _stream_native(msgs, max_nt, image=pil_image)
 
                 for text in stream_iter:
-                    line = json.dumps({"text": text}, ensure_ascii=False) + "\n"
+                    line = json.dumps({"text": prelude + text}, ensure_ascii=False) + "\n"
                     yield line.encode("utf-8")
             except Exception as e:
                 err = json.dumps({"error": str(e)}, ensure_ascii=False) + "\n"
