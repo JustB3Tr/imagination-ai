@@ -162,6 +162,20 @@ def _vlm_no_repeat_ngram() -> int:
         return 4
 
 
+def _vlm_stream_timeout_s() -> float:
+    """
+    Timeout while waiting for streamed decode chunks.
+    Keeps vision requests from hanging silently when generation stalls before first token.
+    """
+    raw = (os.getenv("IMAGINATION_VLM_STREAM_TIMEOUT_S") or "").strip()
+    if not raw:
+        return 120.0
+    try:
+        return max(10.0, min(float(raw), 900.0))
+    except ValueError:
+        return 120.0
+
+
 def _get_device_for_model(model_obj: Any) -> torch.device:
     if hasattr(model_obj, "hf_device_map") and getattr(model_obj, "hf_device_map", None):
         for _, dev in model_obj.hf_device_map.items():
@@ -255,7 +269,12 @@ def generate_stream_vlm(
     room = max(64, max_pos - prompt_len - 32)
     clamped_max = max(32, min(int(max_new_tokens), room))
 
-    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True, timeout=600.0)
+    streamer = TextIteratorStreamer(
+        tokenizer,
+        skip_prompt=True,
+        skip_special_tokens=True,
+        timeout=_vlm_stream_timeout_s(),
+    )
     gen_error: Dict[str, Any] = {"exc": None}
     rp = _vlm_repetition_penalty()
     ngram = _vlm_no_repeat_ngram()

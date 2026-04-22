@@ -47,6 +47,17 @@ def _use_4bit() -> bool:
     return torch.cuda.is_available()
 
 
+def _vlm_stream_timeout_s() -> float:
+    """Timeout while waiting for streamed decode chunks."""
+    raw = (os.getenv("IMAGINATION_VLM_STREAM_TIMEOUT_S") or "").strip()
+    if not raw:
+        return 120.0
+    try:
+        return max(10.0, min(float(raw), 900.0))
+    except ValueError:
+        return 120.0
+
+
 class MultimodalProjector(nn.Module):
     """LLaVA-style 2-layer MLP: vision_dim -> llm_dim -> llm_dim."""
 
@@ -404,7 +415,12 @@ def generate_stream_clip_projector(
     input_ids = torch.tensor([ids], dtype=torch.long, device=device)
     attention_mask = torch.ones_like(input_ids)
 
-    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True, timeout=600.0)
+    streamer = TextIteratorStreamer(
+        tokenizer,
+        skip_prompt=True,
+        skip_special_tokens=True,
+        timeout=_vlm_stream_timeout_s(),
+    )
     gen_error: Dict[str, Any] = {"exc": None}
 
     max_pos = getattr(model.config, "max_position_embeddings", None) or 8192
