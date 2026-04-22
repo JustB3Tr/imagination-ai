@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import os
+import base64
+from io import BytesIO
 from threading import Lock
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -61,6 +63,7 @@ class ChatApiRequest(BaseModel):
     prompt: str = ""
     currentModel: str = "imagination-1.3"
     messages: Optional[List[ChatMessage]] = None
+    image: Optional[str] = None
     max_new_tokens: Optional[int] = None
 
 
@@ -101,7 +104,37 @@ def _messages_dicts(items: List[ChatMessage]) -> List[Dict[str, str]]:
     return [{"role": m.role.strip(), "content": (m.content or "").strip()} for m in items]
 
 
-def _stream_native(messages: List[Dict[str, str]], max_new_tokens: int) -> Iterator[str]:
+def _parse_image_data_url(image_data: str) -> Optional[Any]:
+    """
+    Parse a data URL (``data:image/...;base64,...``) into a PIL image.
+
+    Returns ``None`` on parse/decode errors so text-only requests keep working.
+    """
+    if not image_data:
+        return None
+    s = image_data.strip()
+    if not s.startswith("data:image/"):
+        return None
+    comma = s.find(",")
+    if comma <= 0:
+        return None
+    meta = s[:comma].lower()
+    if ";base64" not in meta:
+        return None
+    b64 = s[comma + 1 :]
+    try:
+        raw = base64.b64decode(b64, validate=False)
+        from PIL import Image
+
+        img = Image.open(BytesIO(raw))
+        return img.convert("RGB")
+    except Exception:
+        return None
+
+
+def _stream_native(
+    messages: List[Dict[str, str]], max_new_tokens: int, image: Optional[Any] = None
+) -> Iterator[str]:
     """Yield cumulative decoded text (same as ``generate_stream_chat`` / VLM stream)."""
     from imagination_v1_3 import RUNTIME, _effective_main_max_new_tokens, generate_stream_chat
     from imagination_runtime.vlm_infer import generate_stream_vlm
@@ -120,7 +153,7 @@ def _stream_native(messages: List[Dict[str, str]], max_new_tokens: int) -> Itera
             messages=messages,
             max_new_tokens=want,
             lock=_GEN_LOCK,
-            image=None,
+            image=image,
         )
         return
 
@@ -134,9 +167,11 @@ def _stream_native(messages: List[Dict[str, str]], max_new_tokens: int) -> Itera
     )
 
 
-def _generate_native(messages: List[Dict[str, str]], max_new_tokens: int) -> str:
+def _generate_native(
+    messages: List[Dict[str, str]], max_new_tokens: int, image: Optional[Any] = None
+) -> str:
     out = ""
-    for chunk in _stream_native(messages, max_new_tokens):
+    for chunk in _stream_native(messages, max_new_tokens, image=image):
         out = chunk
     return out
 
@@ -188,6 +223,7 @@ def attach_generation_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=400, detail="Provide `prompt` and/or `messages`")
         default_max = _effective_main_max_new_tokens()
         max_nt = body.max_new_tokens if body.max_new_tokens is not None else default_max
+        pil_image = _parse_image_data_url(body.image or "")
         try:
             if _web_followups_active():
                 text = final_text_from_stream(
@@ -198,7 +234,7 @@ def attach_generation_routes(app: FastAPI) -> None:
                     )
                 )
             else:
-                text = _generate_native(msgs, max_nt)
+                text = _generate_native(msgs, max_nt, image=pil_image)
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e)) from e
         return {
@@ -224,6 +260,7 @@ def attach_generation_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=400, detail="Provide `prompt` and/or `messages`")
         default_max = _effective_main_max_new_tokens()
         max_nt = body.max_new_tokens if body.max_new_tokens is not None else default_max
+        pil_image = _parse_image_data_url(body.image or "")
 
         def ndjson_chunks() -> Iterator[bytes]:
             try:
@@ -234,7 +271,7 @@ def attach_generation_routes(app: FastAPI) -> None:
                         stream_native=_stream_native,
                     )
                 else:
-                    stream_iter = _stream_native(msgs, max_nt)
+                    stream_iter = _stream_native(msgs, max_nt, image=pil_image)
 
                 for text in stream_iter:
                     line = json.dumps({"text": text}, ensure_ascii=False) + "\n"
