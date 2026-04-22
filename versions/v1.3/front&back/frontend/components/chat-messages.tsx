@@ -105,6 +105,7 @@ export function ChatMessages() {
     agentTrace,
     workspaceSnapshot,
     writeFileStream,
+    showAgentComposerUi,
   } = useChatContext();
   const chat = getCurrentChat();
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -291,7 +292,7 @@ export function ChatMessages() {
           </div>
         ))}
 
-        {workspaceSnapshot?.root ? (
+        {showAgentComposerUi && workspaceSnapshot?.root ? (
           <div className="mb-2 rounded-lg border border-border/60 bg-muted/20 px-2.5 py-2 text-[11px] leading-snug text-muted-foreground">
             <span className="font-medium text-foreground/80">Workspace</span>
             <p className="mt-0.5 break-all font-mono text-[10px] text-foreground/70">
@@ -305,7 +306,8 @@ export function ChatMessages() {
           </div>
         ) : null}
 
-        {(agentTrace.length > 0 || isAgentRunning || writeFileStream) ? (
+        {showAgentComposerUi &&
+        (agentTrace.length > 0 || isAgentRunning || writeFileStream) ? (
           <AgentTracePanel
             entries={agentTrace}
             scriptPreview={writeFileStream}
@@ -313,7 +315,7 @@ export function ChatMessages() {
           />
         ) : null}
 
-        {terminalRuns.length > 0 && (
+        {showAgentComposerUi && terminalRuns.length > 0 && (
           <div className="space-y-3">
             <p className="text-xs uppercase tracking-wide text-muted-foreground">Terminal</p>
             {terminalRuns.map(run => (
@@ -322,7 +324,7 @@ export function ChatMessages() {
           </div>
         )}
 
-        {diffProposals.length > 0 && (
+        {showAgentComposerUi && diffProposals.length > 0 && (
           <div className="space-y-3">
             <p className="text-xs uppercase tracking-wide text-muted-foreground">Diff Preview</p>
             {diffProposals.map(proposal => (
@@ -338,14 +340,16 @@ export function ChatMessages() {
           </div>
         )}
 
-        {mediaArtifacts.length > 0 && (
+        {showAgentComposerUi && mediaArtifacts.length > 0 && (
           <div>
             <p className="mb-2 text-xs uppercase tracking-wide text-muted-foreground">Screen Capture</p>
             <MediaArtifacts items={mediaArtifacts} />
           </div>
         )}
 
-        {summaryReport && <SummaryReportCard report={summaryReport} />}
+        {showAgentComposerUi && summaryReport && (
+          <SummaryReportCard report={summaryReport} />
+        )}
       </div>
     </div>
   );

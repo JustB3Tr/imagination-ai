@@ -145,8 +145,12 @@ def attach_generation_routes(app: FastAPI) -> None:
     """Register /generate, /api/chat, and a simple /health (in addition to /api/health from ASGI core)."""
 
     @app.get("/health")
-    def health() -> Dict[str, str]:
-        return {"status": "ok", "model_name": "Imagination 1.3"}
+    def health() -> Dict[str, Any]:
+        from imagination_runtime.runtime_health import vision_health_dict
+
+        out: Dict[str, Any] = {"status": "ok", "model_name": "Imagination 1.3"}
+        out.update(vision_health_dict())
+        return out
 
     @app.post("/generate")
     def generate_completion(body: GenerateRequest) -> Dict[str, Any]:

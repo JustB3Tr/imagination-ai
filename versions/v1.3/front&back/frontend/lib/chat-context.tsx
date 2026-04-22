@@ -92,6 +92,9 @@ interface ChatContextType {
   agentTrace: AgentTraceEntry[];
   /** Live typewriter preview while a write_file tool call is in progress */
   writeFileStream: WriteFileStreamState | null;
+  /** Agent workspace strip, trace, terminal, diffs — only while `/agent` is active */
+  showAgentComposerUi: boolean;
+  hideAgentComposerUi: () => void;
 }
 
 const ChatContext = createContext<ChatContextType | undefined>(undefined);
@@ -231,6 +234,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const [mediaArtifacts, setMediaArtifacts] = useState<MediaArtifact[]>([]);
   const [summaryReport, setSummaryReport] = useState<SummaryReport | null>(null);
   const [isAgentRunning, setIsAgentRunning] = useState(false);
+  const [showAgentComposerUi, setShowAgentComposerUi] = useState(false);
   const [agentTrace, setAgentTrace] = useState<AgentTraceEntry[]>([]);
   const [writeFileStream, setWriteFileStream] = useState<WriteFileStreamState | null>(null);
   const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -461,6 +465,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     setChats(prev => [newChat, ...prev]);
     setCurrentChatId(newChat.id);
     applyAgentMemoryToUi(null);
+    setShowAgentComposerUi(false);
     return newChat.id;
   }, [applyAgentMemoryToUi, currentModel]);
 
@@ -487,9 +492,14 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       const target = latestRef.current.chats.find(c => c.id === chatId);
       if (target) setCurrentModel(target.model);
       setCurrentChatId(chatId);
+      setShowAgentComposerUi(false);
     },
     []
   );
+
+  const hideAgentComposerUi = useCallback(() => {
+    setShowAgentComposerUi(false);
+  }, []);
 
   const deleteChat = useCallback(
     (chatId: string) => {
@@ -969,6 +979,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       const history = [...priorMessages, { role: 'user' as const, content: augmented }];
 
       addMessage(userText, 'user', attachments, cid);
+      setShowAgentComposerUi(true);
       setIsAgentRunning(true);
       setTerminalRuns([]);
       setDiffProposals([]);
@@ -1129,6 +1140,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         isAgentRunning,
         agentTrace,
         writeFileStream,
+        showAgentComposerUi,
+        hideAgentComposerUi,
       }}
     >
       {children}

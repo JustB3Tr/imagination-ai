@@ -34,6 +34,8 @@ Optional environment variables (set before running, or edit defaults below):
     IMAGINATION_COPY        Set to "1" to copy Drive folder to /content instead of symlink (faster I/O, more disk)
     SKIP_PIP                Set to "1" to skip dependency install
     IMAGINATION_CAD_CODER_PATH        Override coder weights dir (abs or relative to IMAGINATION_ROOT)
+    IMAGINATION_VISION_PROJECTOR_DIR   CLIP+projector bundle dir (abs, or relative to IMAGINATION_ROOT then llm folder)
+    IMAGINATION_USE_CLIP_PROJECTOR     Set to 0 to force native HF VLM instead of CLIP bundle
     IMAGINATION_MAIN_MAX_NEW_TOKENS   Main chat desired max new tokens (default 8192; clamped to context left; stops on EOS)
     IMAGINATION_REASONING_MAX_NEW_TOKENS  Reasoning/Research module (default 8192; max 131072)
     IMAGINATION_CODER_MAX_NEW_TOKENS  Coder tab max new tokens (default 16384; e.g. 100000 for huge scripts)
