@@ -66,11 +66,12 @@ export function ChatSidebar() {
               <MessageSquare className="w-4 h-4 shrink-0" />
               <span className="flex-1 truncate text-sm">{chat.title}</span>
               <button
+                type="button"
                 onClick={(e) => {
                   e.stopPropagation();
                   deleteChat(chat.id);
                 }}
-                className="opacity-0 group-hover:opacity-100 p-1 hover:text-destructive transition-opacity"
+                className="shrink-0 p-1 opacity-100 hover:text-destructive transition-colors"
                 aria-label="Delete chat"
               >
                 <Trash2 className="w-3.5 h-3.5" />

@@ -104,6 +104,39 @@ def _messages_dicts(items: List[ChatMessage]) -> List[Dict[str, str]]:
     return [{"role": m.role.strip(), "content": (m.content or "").strip()} for m in items]
 
 
+def _inject_clip_image_placeholder(
+    messages: List[Dict[str, str]], image: Optional[Any], processor: Any
+) -> List[Dict[str, str]]:
+    """
+    Ensure CLIP+projector prompts carry exactly one image placeholder token.
+
+    The clip_projector path validates that the rendered prompt contains one image token id
+    when ``image`` is present. API chat messages are plain text, so we inject the literal token
+    onto the latest user turn if it is currently missing.
+    """
+    if image is None or not getattr(processor, "is_clip_projector", False):
+        return messages
+    meta = getattr(getattr(processor, "bundle", None), "meta", None) or {}
+    token = str(meta.get("image_token_literal") or meta.get("image_token") or "").strip()
+    if not token:
+        return messages
+
+    out = [dict(m) for m in messages]
+    has_token = any(token in (m.get("content") or "") for m in out)
+    if has_token:
+        return out
+
+    for i in range(len(out) - 1, -1, -1):
+        if (out[i].get("role") or "").strip().lower() != "user":
+            continue
+        prior = (out[i].get("content") or "").strip()
+        out[i]["content"] = f"{prior}\n\n{token}" if prior else token
+        return out
+
+    out.append({"role": "user", "content": token})
+    return out
+
+
 def _parse_image_data_url(image_data: str) -> Optional[Any]:
     """
     Parse a data URL (``data:image/...;base64,...``) into a PIL image.
@@ -146,11 +179,12 @@ def _stream_native(
     want = min(max(32, int(max_new_tokens)), cap)
 
     if RUNTIME.main_is_vlm and RUNTIME.main_processor is not None:
+        msgs_for_vlm = _inject_clip_image_placeholder(messages, image, RUNTIME.main_processor)
         yield from generate_stream_vlm(
             processor=RUNTIME.main_processor,
             tokenizer=RUNTIME.main_tokenizer,
             model=RUNTIME.main_model,
-            messages=messages,
+            messages=msgs_for_vlm,
             max_new_tokens=want,
             lock=_GEN_LOCK,
             image=image,
