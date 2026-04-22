@@ -15,7 +15,7 @@ from typing import Any, Dict, Iterator, List, Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from imagination_runtime.agent_loop import (
     AgenticLoop,
@@ -60,12 +60,53 @@ class GenerateRequest(BaseModel):
 class ChatApiRequest(BaseModel):
     """Payload from Next.js / v0 frontends (prompt + model + optional full history)."""
 
+    model_config = ConfigDict(extra="ignore")
+
     prompt: str = ""
     currentModel: str = "imagination-1.3"
     messages: Optional[List[ChatMessage]] = None
     image: Optional[str] = None
     attachments: Optional[List[Dict[str, Any]]] = None
     max_new_tokens: Optional[int] = None
+
+
+def coerce_chat_api_request_dict(raw: Any) -> Dict[str, Any]:
+    """
+    Normalize arbitrary client/JSON into fields ``ChatApiRequest`` understands.
+    Fills ``prompt`` / ``messages`` from common aliases and avoids empty bodies that
+    break proxies or Pydantic when only legacy keys (``query``, ``message``) are set.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, Any] = dict(raw)
+    p = (
+        out.get("prompt")
+        or out.get("message")
+        or out.get("text")
+        or out.get("query")
+        or out.get("q")
+        or ""
+    )
+    p = p.strip() if isinstance(p, str) else (str(p).strip() if p is not None else "")
+    if p:
+        out["prompt"] = p
+
+    messages = out.get("messages")
+    if not isinstance(messages, list) or len(messages) == 0:
+        if p:
+            out["messages"] = [{"role": "user", "content": p}]
+    if not p:
+        if isinstance(messages, list):
+            for m in reversed(messages):
+                if not isinstance(m, dict):
+                    continue
+                if (str(m.get("role") or "").lower() != "user"):
+                    continue
+                c = m.get("content")
+                if isinstance(c, str) and c.strip():
+                    out["prompt"] = c.strip()
+                    break
+    return out
 
 
 class AgentChatRequest(ChatApiRequest):

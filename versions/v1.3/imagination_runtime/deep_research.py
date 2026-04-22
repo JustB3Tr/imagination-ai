@@ -456,10 +456,37 @@ def attach_deep_and_sync_routes(app: Any) -> None:
     from fastapi import HTTPException, Header, Request
     from fastapi.responses import StreamingResponse
 
-    from imagination_runtime.chat_http import ChatApiRequest
+    from pydantic import ValidationError
+
+    from imagination_runtime.chat_http import ChatApiRequest, coerce_chat_api_request_dict
 
     @app.post("/api/chat/deep")
-    def api_chat_deep(body: ChatApiRequest) -> StreamingResponse:
+    async def api_chat_deep(request: Request) -> StreamingResponse:
+        try:
+            raw: Any = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid_json")
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail="expected_json_object")
+        merged = coerce_chat_api_request_dict(raw)
+        try:
+            body = ChatApiRequest.model_validate(merged)
+        except ValidationError as e:
+            raise HTTPException(status_code=422, detail={"errors": e.errors()}) from e
+
+        uq = (body.prompt or "").strip()
+        if not uq and body.messages:
+            for m in reversed(body.messages):
+                c = (m.content or "").strip()
+                if (m.role or "").lower() == "user" and c:
+                    uq = c
+                    break
+        if not uq:
+            raise HTTPException(
+                status_code=400,
+                detail="empty_prompt: send prompt, message, text, query, or messages with content",
+            )
+
         def gen() -> Iterator[bytes]:
             yield from run_deep_ndjson(body)
 
