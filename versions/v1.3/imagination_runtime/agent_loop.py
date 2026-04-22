@@ -506,7 +506,7 @@ class AgenticLoop:
             convo.append(
                 {
                     "role": "system",
-                    "content": f"Tool result for {tool_name}: {json.dumps(result, ensure_ascii=False)[:4000]}",
+                    "content": f"Tool result for {tool_name}: {json.dumps(result, ensure_ascii=False)[:12000]}",
                 }
             )
 

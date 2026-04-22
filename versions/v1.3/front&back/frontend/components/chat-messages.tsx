@@ -103,6 +103,7 @@ export function ChatMessages() {
     applyDiffProposals,
     isAgentRunning,
     agentTrace,
+    workspaceSnapshot,
   } = useChatContext();
   const chat = getCurrentChat();
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -284,6 +285,20 @@ export function ChatMessages() {
             </div>
           </div>
         ))}
+
+        {workspaceSnapshot?.root ? (
+          <div className="mb-2 rounded-lg border border-border/60 bg-muted/20 px-2.5 py-2 text-[11px] leading-snug text-muted-foreground">
+            <span className="font-medium text-foreground/80">Workspace</span>
+            <p className="mt-0.5 break-all font-mono text-[10px] text-foreground/70">
+              {workspaceSnapshot.root}
+            </p>
+            {workspaceSnapshot.session_id ? (
+              <p className="mt-1 text-[10px]">
+                Session <span className="font-mono text-foreground/80">{workspaceSnapshot.session_id}</span>
+              </p>
+            ) : null}
+          </div>
+        ) : null}
 
         {(agentTrace.length > 0 || isAgentRunning) &&
           (agentTrace.length > 0 ? (

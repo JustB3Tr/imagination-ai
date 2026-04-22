@@ -28,14 +28,6 @@ export interface Message {
   answerPhase?: 'idle' | 'preliminary' | 'final';
 }
 
-export interface Chat {
-  id: string;
-  title: string;
-  messages: Message[];
-  createdAt: Date;
-  model: ModelType;
-}
-
 export type ModelType = 'imagination-1.3' | 'imagination-1.3-pro' | 'imagination-1.3-coder';
 
 export interface User {
@@ -107,4 +99,27 @@ export interface AgentTraceEntry {
   callId?: string;
   detail?: string;
   ok?: boolean;
+}
+
+/** Persisted Composer session (trace, workspace, diffs) so refresh / chat switch can restore UI. */
+export interface AgentChatMemory {
+  sessionId?: string;
+  /** Backend workspace root (folder with session files); kept if tree snapshot is omitted. */
+  workspaceRoot?: string;
+  workspaceSnapshot?: WorkspaceSnapshot | null;
+  agentTrace: AgentTraceEntry[];
+  diffProposals: DiffProposal[];
+  terminalRuns: TerminalRun[];
+  mediaArtifacts: MediaArtifact[];
+  summaryReport?: SummaryReport | null;
+}
+
+export interface Chat {
+  id: string;
+  title: string;
+  messages: Message[];
+  createdAt: Date;
+  model: ModelType;
+  /** Saved agent / workspace state for this thread (IndexedDB + optional sync). */
+  agentMemory?: AgentChatMemory | null;
 }

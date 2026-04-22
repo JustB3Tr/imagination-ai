@@ -6,11 +6,13 @@ import {
   useState,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   type ReactNode,
 } from 'react';
 import { useSession, signIn as nextAuthSignIn, signOut as nextAuthSignOut } from 'next-auth/react';
 import type {
+  AgentChatMemory,
   AgentTraceEntry,
   Attachment,
   Chat,
@@ -97,6 +99,78 @@ const OFFLINE_ASSISTANT_MESSAGE =
 
 type AgentEvent = Record<string, unknown>;
 
+const MAX_TRACE_DETAIL_PERSIST = 8000;
+
+function buildAgentMemorySnapshot(
+  sessionId: string | null,
+  workspaceSnapshot: WorkspaceSnapshot | null,
+  agentTrace: AgentTraceEntry[],
+  diffProposals: DiffProposal[],
+  terminalRuns: TerminalRun[],
+  mediaArtifacts: MediaArtifact[],
+  summaryReport: SummaryReport | null
+): AgentChatMemory | null {
+  const hasSession = !!(sessionId && sessionId.trim());
+  const hasWs = !!(workspaceSnapshot && workspaceSnapshot.root);
+  const hasAny =
+    hasSession ||
+    hasWs ||
+    agentTrace.length > 0 ||
+    diffProposals.length > 0 ||
+    terminalRuns.length > 0 ||
+    mediaArtifacts.length > 0 ||
+    !!summaryReport;
+  if (!hasAny) return null;
+
+  const trace = agentTrace.map(e => ({
+    ...e,
+    detail:
+      e.detail && e.detail.length > MAX_TRACE_DETAIL_PERSIST
+        ? e.detail.slice(0, MAX_TRACE_DETAIL_PERSIST) + '\u2026'
+        : e.detail,
+  }));
+  const media = mediaArtifacts.map(m => ({
+    ...m,
+    src: m.src.startsWith('data:') ? '' : m.src,
+  }));
+
+  return {
+    sessionId: sessionId ?? undefined,
+    workspaceRoot: workspaceSnapshot?.root,
+    workspaceSnapshot: workspaceSnapshot ?? undefined,
+    agentTrace: trace,
+    diffProposals: diffProposals.map(d => ({ ...d })),
+    terminalRuns: terminalRuns.map(t => ({ ...t })),
+    mediaArtifacts: media,
+    summaryReport: summaryReport ?? undefined,
+  };
+}
+
+function mergeLiveAgentIntoChats(
+  chats: Chat[],
+  currentChatId: string | null,
+  sessionId: string | null,
+  workspaceSnapshot: WorkspaceSnapshot | null,
+  agentTrace: AgentTraceEntry[],
+  diffProposals: DiffProposal[],
+  terminalRuns: TerminalRun[],
+  mediaArtifacts: MediaArtifact[],
+  summaryReport: SummaryReport | null
+): Chat[] {
+  if (!currentChatId) return chats;
+  const snap = buildAgentMemorySnapshot(
+    sessionId,
+    workspaceSnapshot,
+    agentTrace,
+    diffProposals,
+    terminalRuns,
+    mediaArtifacts,
+    summaryReport
+  );
+  if (!snap) return chats;
+  return chats.map(c => (c.id === currentChatId ? { ...c, agentMemory: snap } : c));
+}
+
 function persistedToChat(c: PersistedChat): Chat {
   return {
     id: c.id,
@@ -112,6 +186,7 @@ function persistedToChat(c: PersistedChat): Chat {
       researchTrace: m.researchTrace,
       answerPhase: m.answerPhase,
     })),
+    agentMemory: c.agentMemory ?? undefined,
   };
 }
 
@@ -131,6 +206,7 @@ function chatToPersisted(c: Chat): PersistedChat {
     model: c.model,
     createdAt: c.createdAt.toISOString(),
     messages,
+    agentMemory: c.agentMemory ?? undefined,
   };
 }
 
@@ -153,8 +229,32 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const [isAgentRunning, setIsAgentRunning] = useState(false);
   const [agentTrace, setAgentTrace] = useState<AgentTraceEntry[]>([]);
   const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const latestRef = useRef({ chats, currentChatId, currentModel });
-  latestRef.current = { chats, currentChatId, currentModel };
+  const currentChatIdRef = useRef<string | null>(null);
+  const latestRef = useRef({
+    chats,
+    currentChatId,
+    currentModel,
+    agentSessionId,
+    workspaceSnapshot,
+    agentTrace,
+    diffProposals,
+    terminalRuns,
+    mediaArtifacts,
+    summaryReport,
+  });
+  currentChatIdRef.current = currentChatId;
+  latestRef.current = {
+    chats,
+    currentChatId,
+    currentModel,
+    agentSessionId,
+    workspaceSnapshot,
+    agentTrace,
+    diffProposals,
+    terminalRuns,
+    mediaArtifacts,
+    summaryReport,
+  };
 
   useEffect(() => {
     if (session?.user) {
@@ -193,11 +293,22 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     persistTimerRef.current = setTimeout(() => {
       persistTimerRef.current = null;
       void (async () => {
-        const { chats: c, currentChatId: id, currentModel: m } = latestRef.current;
+        const r = latestRef.current;
+        const merged = mergeLiveAgentIntoChats(
+          r.chats,
+          r.currentChatId,
+          r.agentSessionId,
+          r.workspaceSnapshot,
+          r.agentTrace,
+          r.diffProposals,
+          r.terminalRuns,
+          r.mediaArtifacts,
+          r.summaryReport
+        );
         const state = {
-          chats: c.map(chatToPersisted),
-          currentChatId: id,
-          currentModel: m,
+          chats: merged.map(chatToPersisted),
+          currentChatId: r.currentChatId,
+          currentModel: r.currentModel,
           updatedAt: new Date().toISOString(),
         };
         await saveAppState(state);
@@ -210,22 +321,109 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     return () => {
       if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
     };
-  }, [chats, currentChatId, currentModel, schedulePersist]);
+  }, [
+    chats,
+    currentChatId,
+    currentModel,
+    agentSessionId,
+    workspaceSnapshot,
+    agentTrace,
+    diffProposals,
+    terminalRuns,
+    mediaArtifacts,
+    summaryReport,
+    schedulePersist,
+  ]);
 
   useEffect(() => {
     if (!storageHydrated) return;
     const flush = () => {
-      const { chats: c, currentChatId: id, currentModel: m } = latestRef.current;
+      const r = latestRef.current;
+      const merged = mergeLiveAgentIntoChats(
+        r.chats,
+        r.currentChatId,
+        r.agentSessionId,
+        r.workspaceSnapshot,
+        r.agentTrace,
+        r.diffProposals,
+        r.terminalRuns,
+        r.mediaArtifacts,
+        r.summaryReport
+      );
       void saveAppState({
-        chats: c.map(chatToPersisted),
-        currentChatId: id,
-        currentModel: m,
+        chats: merged.map(chatToPersisted),
+        currentChatId: r.currentChatId,
+        currentModel: r.currentModel,
         updatedAt: new Date().toISOString(),
       });
     };
     window.addEventListener('beforeunload', flush);
     return () => window.removeEventListener('beforeunload', flush);
   }, [storageHydrated]);
+
+  const applyAgentMemoryToUi = useCallback((mem: AgentChatMemory | null | undefined) => {
+    const m = mem ?? null;
+    const sid = m?.sessionId ?? null;
+    setAgentSessionId(sid);
+    agentSessionIdRef.current = sid;
+    if (m?.workspaceSnapshot) {
+      setWorkspaceSnapshot(m.workspaceSnapshot);
+    } else if (m?.workspaceRoot && m?.sessionId) {
+      setWorkspaceSnapshot({
+        root: m.workspaceRoot,
+        session_id: m.sessionId,
+        tree: null,
+        truncated: false,
+      });
+    } else {
+      setWorkspaceSnapshot(null);
+    }
+    setAgentTrace(m?.agentTrace ?? []);
+    setDiffProposals(m?.diffProposals ?? []);
+    setTerminalRuns(m?.terminalRuns ?? []);
+    setMediaArtifacts(m?.mediaArtifacts ?? []);
+    setSummaryReport(m?.summaryReport ?? null);
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!storageHydrated) return;
+    if (!currentChatId) {
+      applyAgentMemoryToUi(null);
+      return;
+    }
+    const mem = latestRef.current.chats.find(c => c.id === currentChatId)?.agentMemory;
+    applyAgentMemoryToUi(mem ?? null);
+  }, [storageHydrated, currentChatId, applyAgentMemoryToUi]);
+
+  useEffect(() => {
+    if (!storageHydrated || !currentChatId) return;
+    const r = latestRef.current;
+    const snap = buildAgentMemorySnapshot(
+      r.agentSessionId,
+      r.workspaceSnapshot,
+      r.agentTrace,
+      r.diffProposals,
+      r.terminalRuns,
+      r.mediaArtifacts,
+      r.summaryReport
+    );
+    if (!snap) return;
+    const prevMem = r.chats.find(c => c.id === currentChatId)?.agentMemory ?? null;
+    if (JSON.stringify(snap) === JSON.stringify(prevMem)) return;
+    setChats(prev =>
+      prev.map(c => (c.id === currentChatId ? { ...c, agentMemory: snap } : c))
+    );
+  }, [
+    storageHydrated,
+    currentChatId,
+    agentSessionId,
+    workspaceSnapshot,
+    agentTrace,
+    diffProposals,
+    terminalRuns,
+    mediaArtifacts,
+    summaryReport,
+  ]);
 
   const createNewChat = useCallback((): string => {
     const newChat: Chat = {
@@ -237,26 +435,62 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     };
     setChats(prev => [newChat, ...prev]);
     setCurrentChatId(newChat.id);
+    applyAgentMemoryToUi(null);
     return newChat.id;
-  }, [currentModel]);
+  }, [applyAgentMemoryToUi, currentModel]);
 
   const selectChat = useCallback(
     (chatId: string) => {
+      const leavingId = currentChatIdRef.current;
+      if (leavingId) {
+        const r = latestRef.current;
+        const snap = buildAgentMemorySnapshot(
+          r.agentSessionId,
+          r.workspaceSnapshot,
+          r.agentTrace,
+          r.diffProposals,
+          r.terminalRuns,
+          r.mediaArtifacts,
+          r.summaryReport
+        );
+        if (snap) {
+          setChats(prev =>
+            prev.map(c => (c.id === leavingId ? { ...c, agentMemory: snap } : c))
+          );
+        }
+      }
+      const target = latestRef.current.chats.find(c => c.id === chatId);
+      if (target) setCurrentModel(target.model);
       setCurrentChatId(chatId);
-      const chat = latestRef.current.chats.find(c => c.id === chatId);
-      if (chat) setCurrentModel(chat.model);
     },
     []
   );
 
   const deleteChat = useCallback(
     (chatId: string) => {
+      const r = latestRef.current;
+      const deletingCurrent = chatId === currentChatId;
+      const snap = deletingCurrent
+        ? buildAgentMemorySnapshot(
+            r.agentSessionId,
+            r.workspaceSnapshot,
+            r.agentTrace,
+            r.diffProposals,
+            r.terminalRuns,
+            r.mediaArtifacts,
+            r.summaryReport
+          )
+        : null;
       setChats(prev => {
-        const next = prev.filter(c => c.id !== chatId);
-        if (currentChatId === chatId) {
-          setCurrentChatId(next[0]?.id ?? null);
+        const patched =
+          snap && deletingCurrent
+            ? prev.map(c => (c.id === chatId ? { ...c, agentMemory: snap } : c))
+            : prev;
+        const filtered = patched.filter(c => c.id !== chatId);
+        if (deletingCurrent) {
+          setCurrentChatId(filtered[0]?.id ?? null);
         }
-        return next;
+        return filtered;
       });
     },
     [currentChatId]
@@ -431,7 +665,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           const exT = existing.createdAt.getTime();
           const inT = incoming.createdAt.getTime();
           if (inT >= exT) {
-            byId.set(incoming.id, incoming);
+            const mergedChat: Chat = {
+              ...incoming,
+              agentMemory: incoming.agentMemory ?? existing.agentMemory ?? null,
+            };
+            byId.set(incoming.id, mergedChat);
             merged += 1;
           }
         }
