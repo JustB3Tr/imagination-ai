@@ -215,9 +215,10 @@ def _register_auth_and_meta_routes(app: Any, *, home_url: str, backend_only: boo
 
     @app.get("/api/health")
     async def api_health():
-        from imagination_runtime.runtime_health import vision_health_dict
+        from imagination_runtime.runtime_health import health_version_dict, vision_health_dict
 
         payload: dict = {"ok": True, "service": "imagination-v1.3", "status": "ok"}
+        payload.update(health_version_dict())
         payload.update(vision_health_dict())
         return JSONResponse(payload)
 

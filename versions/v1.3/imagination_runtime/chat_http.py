@@ -287,9 +287,10 @@ def attach_generation_routes(app: FastAPI) -> None:
 
     @app.get("/health")
     def health() -> Dict[str, Any]:
-        from imagination_runtime.runtime_health import vision_health_dict
+        from imagination_runtime.runtime_health import health_version_dict, vision_health_dict
 
         out: Dict[str, Any] = {"status": "ok", "model_name": "Imagination 1.3"}
+        out.update(health_version_dict())
         out.update(vision_health_dict())
         return out
 

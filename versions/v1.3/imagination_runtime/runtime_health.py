@@ -2,7 +2,25 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict
+
+
+def v13_line_version() -> str:
+    """Semver from ``versions/v1.3/VERSION`` next to this package (Colab + local)."""
+    try:
+        p = Path(__file__).resolve().parent.parent / "VERSION"
+        if p.is_file():
+            s = p.read_text(encoding="utf-8", errors="replace").strip()
+            return s or "unknown"
+    except (OSError, TypeError, ValueError):
+        pass
+    return "unknown"
+
+
+def health_version_dict() -> Dict[str, Any]:
+    v = v13_line_version()
+    return {"backend_version": v, "v13": v}
 
 
 def vision_health_dict() -> Dict[str, Any]:
