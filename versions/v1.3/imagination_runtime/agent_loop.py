@@ -231,6 +231,78 @@ def _read_text_safe(path: Path, *, max_bytes: int = 300_000) -> Tuple[str, bool]
     return raw.decode("utf-8", errors="replace"), clipped
 
 
+def _normalize_jsonish_quotes(t: str) -> str:
+    """Replace curly/smart quotes that break strict JSON.parse."""
+    return (
+        (t or "")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("\u00ab", '"')
+        .replace("\u00bb", '"')
+    )
+
+
+def _balanced_object_from(t: str, start: int) -> Optional[str]:
+    """Return substring t[start:end+1] for first balanced `{` … `}` brace run from ``start``."""
+    if start < 0 or start >= len(t) or t[start] != "{":
+        return None
+    depth = 0
+    for i in range(start, len(t)):
+        ch = t[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return t[start : i + 1]
+            if depth < 0:
+                return None
+    return None
+
+
+def _last_balanced_json_slice(t: str) -> Optional[str]:
+    """
+    Many models emit prose then a JSON object at the end. Try balanced slices from each ``{``
+    position (right-to-left) until ``json.loads`` succeeds.
+    """
+    if not t:
+        return None
+    pos = len(t)
+    while True:
+        start = t.rfind("{", 0, pos)
+        if start < 0:
+            return None
+        blob = _balanced_object_from(t, start)
+        if blob and len(blob) > 2:
+            for cand in (blob, _normalize_jsonish_quotes(blob)):
+                try:
+                    obj = json.loads(cand)
+                    if isinstance(obj, dict):
+                        return cand
+                except Exception:
+                    pass
+        pos = start - 1
+        if pos < 0:
+            break
+    return None
+
+
+def _try_ast_literal_dict(t: str) -> Optional[JsonDict]:
+    """Some checkpoints emit Python dict syntax (single quotes). ``ast.literal_eval`` is safe here."""
+    blob = (t or "").strip()
+    if not (blob.startswith("{") and blob.endswith("}")):
+        return None
+    if blob.count("'") < 2:
+        return None
+    try:
+        v = ast.literal_eval(blob)
+        return v if isinstance(v, dict) else None
+    except Exception:
+        return None
+
+
 def _strip_composer_preamble(text: str) -> str:
     """Remove common reasoning wrappers so a trailing JSON object can be parsed."""
     t = (text or "").strip()
@@ -270,7 +342,8 @@ def _pick_agent_turn_dict(candidates: List[JsonDict]) -> Optional[JsonDict]:
     if not candidates:
         return None
     for d in reversed(candidates):
-        if str(d.get("final_answer") or "").strip():
+        fa = str(d.get("final_answer") or "").strip()
+        if fa and len(fa) > 8:
             return d
     for d in reversed(candidates):
         tc = d.get("tool_call")
@@ -288,27 +361,48 @@ def _extract_json_object(text: str) -> Optional[JsonDict]:
         if m:
             t = m.group(1).strip()
 
-    try:
-        loaded = json.loads(t)
-        if isinstance(loaded, dict):
-            return loaded
-    except Exception:
-        pass
-
-    candidates = _collect_json_dict_candidates(t)
-    picked = _pick_agent_turn_dict(candidates)
-    if picked is not None:
-        return picked
-
-    start = t.find("{")
-    end = t.rfind("}")
-    if start != -1 and end != -1 and end > start:
+    t_norm = _normalize_jsonish_quotes(t)
+    for variant in (t, t_norm):
         try:
-            loaded = json.loads(t[start : end + 1])
+            loaded = json.loads(variant)
             if isinstance(loaded, dict):
                 return loaded
         except Exception:
-            return None
+            pass
+
+    for variant in (t, t_norm):
+        candidates = _collect_json_dict_candidates(variant)
+        picked = _pick_agent_turn_dict(candidates)
+        if picked is not None:
+            return picked
+
+    for variant in (t, t_norm):
+        start = variant.find("{")
+        end = variant.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                loaded = json.loads(variant[start : end + 1])
+                if isinstance(loaded, dict):
+                    return loaded
+            except Exception:
+                pass
+
+    slice_s = _last_balanced_json_slice(t) or _last_balanced_json_slice(t_norm)
+    if slice_s:
+        try:
+            loaded = json.loads(slice_s)
+            if isinstance(loaded, dict):
+                return loaded
+        except Exception:
+            pass
+        lit = _try_ast_literal_dict(slice_s)
+        if lit is not None:
+            return lit
+
+    lit2 = _try_ast_literal_dict(t) or _try_ast_literal_dict(t_norm)
+    if lit2 is not None:
+        return lit2
+
     return None
 
 
@@ -386,10 +480,17 @@ class AgenticLoop:
     def run(self, *, user_prompt: str, messages: Optional[List[Dict[str, str]]] = None) -> Iterator[JsonDict]:
         convo: List[Dict[str, str]] = [{"role": "system", "content": _DEFAULT_SYSTEM_PROMPT}]
         if messages:
+            prev_key: Optional[Tuple[str, str]] = None
             for m in messages:
                 role = (m.get("role") or "").strip().lower()
-                if role in ("user", "assistant"):
-                    convo.append({"role": role, "content": str(m.get("content") or "")})
+                if role not in ("user", "assistant"):
+                    continue
+                content = str(m.get("content") or "")
+                key = (role, content)
+                if key == prev_key:
+                    continue
+                prev_key = key
+                convo.append({"role": role, "content": content})
         elif user_prompt.strip():
             convo.append({"role": "user", "content": user_prompt.strip()})
         else:
@@ -415,8 +516,10 @@ class AgenticLoop:
                     {
                         "role": "system",
                         "content": (
-                            "Reply with ONE JSON object only (no markdown). End the message with that object. "
-                            "Include tool_call OR final_answer in the same object as thought."
+                            "Reply with ONE JSON object only (no markdown fences, no prose after the object). "
+                            "Include tool_call OR final_answer in the same object as thought. "
+                            'Minimal valid example: {"thought":"create file","tool_call":'
+                            '{"name":"write_file","args":{"path":"hello.py","content":"print(1)\\n","reason":"demo"}}}'
                         ),
                     }
                 )

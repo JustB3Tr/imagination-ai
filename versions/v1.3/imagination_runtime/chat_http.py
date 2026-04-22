@@ -407,7 +407,7 @@ def attach_generation_routes(app: FastAPI) -> None:
         default_max = _effective_main_max_new_tokens()
         max_nt = body.max_new_tokens if body.max_new_tokens is not None else default_max
         # Composer JSON + write_file bodies need headroom; small caps truncate tool JSON mid-stream.
-        max_nt = min(default_max, max(int(max_nt), min(2048, default_max)))
+        max_nt = min(default_max, max(int(max_nt), min(4096, default_max)))
 
         def _model_generate(model_messages: List[Dict[str, str]], req_max_new_tokens: int) -> str:
             return _generate_native(model_messages, req_max_new_tokens)
